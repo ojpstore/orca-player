@@ -1,8 +1,8 @@
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
-import { mkdir, open as openFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open as openFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'])
 
@@ -173,7 +173,12 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
   let current = null // { id, file, size }
   let job = null // { id, abort, promise } — 완료 판정은 id가 아니라 이 객체로 한다.
   let seq = 0
-  const discard = (file) => Promise.all([file, `${file}.part`].map((f) => rm(f, { force: true }).catch(() => {})))
+  // 영상 파일과, 영상+소리를 합치다 실패해 남는 조각(<이름>.f137.mp4, .part, .ytdl, .temp.mp4 등)을 함께 지운다.
+  const discard = async (file) => {
+    const prefix = basename(file, extname(file)) + '.'
+    const names = await readdir(dirname(file)).catch(() => [])
+    await Promise.all([file, ...names.filter((n) => n.startsWith(prefix)).map((n) => join(dirname(file), n))].map((f) => rm(f, { force: true }).catch(() => {})))
+  }
 
   async function fetchVideo(id) {
     if (!/^[\w-]{11}$/.test(id ?? '')) return { error: '잘못된 영상 id입니다.' }
@@ -238,7 +243,16 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
     }
   }
 
-  return { fetch: fetchVideo, chunk }
+  // 받던 다운로드를 멈추고 받아 둔 영상 파일도 지운다.
+  async function reset() {
+    job?.abort.abort()
+    job = null
+    const old = current
+    current = null
+    if (old) await discard(old.file)
+  }
+
+  return { fetch: fetchVideo, chunk, reset }
 }
 
 // --- 음악 폴더 고르기: 패널(브라우저)의 폴더 선택 창 대신 윈도 기본 폴더 트리 창을 띄운다.
@@ -471,5 +485,6 @@ export default function activate(plugin) {
 
   const videos = videoFetcher({ dir: VIDEO_DIR, find: () => findYtDlp(), download: downloadVideo, post: (name, data) => plugin.panels.post(name, data) })
   plugin.panels.handle('youtube.fetch', ({ id } = {}) => videos.fetch(id))
+  plugin.panels.handle('youtube.reset', () => videos.reset())
   plugin.panels.handle('youtube.chunk', ({ id, offset = 0 } = {}) => videos.chunk(id, offset))
 }

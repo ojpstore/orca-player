@@ -14,7 +14,7 @@ async function fakeFetcher() {
     new Promise((resolve, reject) => {
       runs.push({ id, file, signal, finish: async (body) => (await writeFile(file, body), resolve(file)), fail: () => reject(new Error('실패')) })
     })
-  return { runs, videos: videoFetcher({ dir, find: () => 'yt-dlp.exe', download, post: () => {}, wait: 50 }) }
+  return { dir, runs, videos: videoFetcher({ dir, find: () => 'yt-dlp.exe', download, post: () => {}, wait: 50 }) }
 }
 const A = 'AAAAAAAAAAA'
 const B = 'BBBBBBBBBBB'
@@ -145,4 +145,35 @@ test('입력칸 있는 폴더 창이 실패하면 기본 폴더 창으로 다시
   assert.equal(await pickFolder(run), 'D:\music')
   assert.equal(calls.length, 2)
   assert.equal(await pickFolder(async () => null), null) // 취소는 다시 열지 않는다.
+})
+
+test('다운로드가 실패하면 합치다 남은 조각 파일도 지운다', async () => {
+  const { dir, runs, videos } = await fakeFetcher()
+  const pending = videos.fetch(A)
+  await tick()
+  const base = runs[0].file.replace(/\.mp4$/, '')
+  const leftovers = [`${base}.f137.mp4`, `${base}.f140.m4a.part`, `${base}.temp.mp4`]
+  for (const f of leftovers) await writeFile(f, 'x')
+  const other = join(dir, 'ZZZZZZZZZZZ-1.f137.mp4') // 다른 영상 파일은 건드리지 않는다.
+  await writeFile(other, 'x')
+  runs[0].fail()
+  await pending
+  for (const f of leftovers) assert.equal(existsSync(f), false, f)
+  assert.equal(existsSync(other), true)
+})
+
+test('초기화하면 받던 다운로드를 멈추고 받아 둔 영상 파일을 지운다', async () => {
+  const { runs, videos } = await fakeFetcher()
+  const first = videos.fetch(A)
+  await tick()
+  await runs[0].finish('abc')
+  assert.deepEqual(await first, { size: 3 })
+  assert.equal(existsSync(runs[0].file), true)
+  await videos.reset()
+  assert.equal(existsSync(runs[0].file), false)
+  assert.deepEqual(await videos.chunk(A), { error: '받아 둔 영상이 바뀌었습니다.' })
+  videos.fetch(B)
+  await tick()
+  await videos.reset()
+  assert.equal(runs[1].signal.aborted, true) // 받는 중이던 것은 중단한다.
 })
