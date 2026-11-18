@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <title>뮤직 플레이어</title>
+    <style>
+      * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--orca-border) transparent; }
+      [hidden] { display: none !important; }
+      html, body { height: 100%; }
+      :root { --radius: var(--orca-radius, 6px); --hl: #ff5c8a; }
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        font: 13px/1.5 system-ui, 'Segoe UI', 'Malgun Gothic', sans-serif;
+        color: var(--orca-foreground);
+        background: var(--orca-background);
+      }
+      body.dragging { outline: 2px dashed var(--hl); outline-offset: -6px; }
+      button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
+      :focus-visible { outline: 2px solid var(--orca-ring); outline-offset: -1px; }
+      svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+      .icon { width: 30px; height: 30px; display: grid; place-items: center; color: var(--orca-muted-foreground); border-radius: var(--radius); flex: none; }
+      .icon:hover { background: var(--orca-accent); color: var(--orca-accent-foreground); }
+      .icon[aria-pressed='true'] { color: var(--hl); }
+      .icon:disabled { opacity: 0.4; cursor: default; background: none; }
+
+      .now { display: flex; gap: 10px; align-items: center; padding: 12px 12px 8px; flex: none; }
+      .cover {
+        width: 52px; height: 52px; flex: none; border-radius: var(--radius); object-fit: cover;
+        background: linear-gradient(160deg, #ff5c8a, #7c4dff); display: grid; place-items: center; color: #fff;
+      }
+      .cover svg { width: 24px; height: 24px; }
+      .meta { min-width: 0; flex: 1; }
+      .title { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .artist { font-size: 12px; color: var(--orca-muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+      .lyrics {
+        position: relative; flex: none; height: 180px; overflow-y: auto; margin: 0 12px;
+        padding: 76px 8px; text-align: center; border: 1px solid var(--orca-border); border-radius: var(--radius);
+        background: var(--orca-card); scroll-behavior: smooth;
+        mask-image: linear-gradient(transparent, #000 18%, #000 82%, transparent);
+      }
+      .lyrics .empty { color: var(--orca-muted-foreground); margin: 0; }
+      .line { padding: 4px 2px; color: var(--orca-muted-foreground); cursor: pointer; border-radius: 4px; transition: color 0.2s, transform 0.2s; }
+      .line:hover { background: var(--orca-accent); }
+      .line span { display: block; font-size: 12px; }
+      .line span:first-child { font-size: 14px; }
+      .line.current { color: var(--orca-foreground); font-weight: 600; transform: scale(1.04); }
+      .line.current span:first-child { color: var(--hl); }
+      .sync { display: flex; justify-content: flex-end; align-items: center; gap: 2px; margin: 2px 12px 0; font-size: 11px; color: var(--orca-muted-foreground); flex: none; }
+      .sync button { padding: 0 6px; height: 20px; border-radius: 4px; }
+      .sync button:hover { background: var(--orca-accent); }
+
+      .seek { display: flex; align-items: center; gap: 8px; padding: 6px 12px 0; font-size: 11px; color: var(--orca-muted-foreground); font-variant-numeric: tabular-nums; flex: none; }
+      input[type='range'] { flex: 1; min-width: 0; accent-color: var(--hl); margin: 0; }
+      .controls { display: flex; align-items: center; justify-content: center; gap: 2px; padding: 4px 12px; flex: none; }
+      .play { width: 40px; height: 40px; border-radius: 50%; color: #fff; background: linear-gradient(160deg, #ff5c8a, #7c4dff); }
+      .play:hover { background: linear-gradient(160deg, #ff5c8a, #7c4dff); filter: brightness(1.1); color: #fff; }
+      .play svg { width: 18px; height: 18px; fill: currentColor; }
+      .volume { display: flex; align-items: center; gap: 4px; width: 96px; margin-left: 6px; }
+      .badge { position: relative; }
+      .badge::after { content: attr(data-badge); position: absolute; right: 3px; bottom: 2px; font-size: 9px; font-weight: 700; }
+
+      .list-head { display: flex; align-items: center; gap: 2px; padding: 8px 8px 4px 12px; border-top: 1px solid var(--orca-border); margin-top: 6px; flex: none; }
+      .list-head h2 { flex: 1; margin: 0; font-size: 12px; font-weight: 600; color: var(--orca-muted-foreground); }
+      .playlist { flex: 1 1 30%; min-height: 80px; overflow-y: auto; margin: 0; padding: 0 8px 12px; list-style: none; }
+      .playlist li { display: flex; align-items: center; gap: 8px; padding: 0 2px 0 8px; height: 30px; border-radius: var(--radius); cursor: pointer; }
+      .playlist li:hover { background: var(--orca-accent); }
+      .playlist li.playing { color: var(--hl); font-weight: 600; }
+      .playlist .no { width: 18px; flex: none; font-size: 11px; color: var(--orca-muted-foreground); text-align: right; font-variant-numeric: tabular-nums; }
+      .playlist .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .playlist .lrc { font-size: 10px; padding: 0 4px; border: 1px solid currentColor; border-radius: 3px; opacity: 0.6; flex: none; }
+      .playlist li .icon { width: 24px; height: 24px; visibility: hidden; }
+      .playlist li:hover .icon { visibility: visible; }
+      .hint { margin: 16px 8px; text-align: center; font-size: 12px; color: var(--orca-muted-foreground); }
+    </style>
+  </head>
+  <body>
+    <svg hidden>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12.5-7.5z" /></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></symbol>
+      <symbol id="i-prev" viewBox="0 0 24 24"><path d="M18 6 9 12l9 6zM6 6v12" /></symbol>
+      <symbol id="i-next" viewBox="0 0 24 24"><path d="m6 6 9 6-9 6zM18 6v12" /></symbol>
+      <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" /></symbol>
+      <symbol id="i-repeat" viewBox="0 0 24 24"><path d="m17 2 4 4-4 4M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4M21 13v2a3 3 0 0 1-3 3H3" /></symbol>
+      <symbol id="i-vol" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4zM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14" /></symbol>
+      <symbol id="i-mute" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4zM22 9l-6 6M16 9l6 6" /></symbol>
+      <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z" /></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></symbol>
+      <symbol id="i-clear" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4h6v3" /></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12" /></symbol>
+    </svg>
+
+    <section class="now">
+      <div class="cover" id="cover-box"><svg><use href="#i-music" /></svg></div>
+      <div class="meta">
+        <div class="title" id="title">재생할 곡을 추가하세요</div>
+        <div class="artist" id="artist">파일을 끌어다 놓아도 됩니다</div>
+      </div>
+    </section>
+
+    <div class="lyrics" id="lyrics"><p class="empty">가사 없음</p></div>
+    <div class="sync" id="sync" hidden>
+      <span>싱크</span>
+      <button id="sync-minus" title="가사를 0.5초 빠르게">-0.5초</button>
+      <span id="sync-value">0.0초</span>
+      <button id="sync-plus" title="가사를 0.5초 늦게">+0.5초</button>
+    </div>
+
+    <div class="seek">
+      <span id="pos">0:00</span>
+      <input type="range" id="seek" min="0" max="0" step="0.1" value="0" aria-label="재생 위치" />
+      <span id="dur">0:00</span>
+    </div>
+
+    <div class="controls">
+      <button class="icon" id="shuffle" aria-pressed="false" title="셔플"><svg><use href="#i-shuffle" /></svg></button>
+      <button class="icon" id="prev" title="이전 곡"><svg><use href="#i-prev" /></svg></button>
+      <button class="icon play" id="play" title="재생"><svg><use href="#i-play" /></svg></button>
+      <button class="icon" id="next" title="다음 곡"><svg><use href="#i-next" /></svg></button>
+      <button class="icon badge" id="repeat" aria-pressed="false" title="반복 안 함"><svg><use href="#i-repeat" /></svg></button>
+      <div class="volume">
+        <button class="icon" id="mute" title="음소거"><svg><use href="#i-vol" /></svg></button>
+        <input type="range" id="volume" min="0" max="1" step="0.01" value="0.8" aria-label="볼륨" />
+      </div>
+    </div>
+
+    <div class="list-head">
+      <h2 id="count">재생 목록</h2>
+      <button class="icon" id="add-files" title="파일 추가 (음악, .lrc)"><svg><use href="#i-file" /></svg></button>
+      <button class="icon" id="add-folder" title="폴더 추가"><svg><use href="#i-folder" /></svg></button>
+      <button class="icon" id="clear" title="목록 비우기"><svg><use href="#i-clear" /></svg></button>
+    </div>
+    <ul class="playlist" id="playlist"></ul>
+
+    <input type="file" id="file-input" multiple accept="audio/*,.mp3,.flac,.m4a,.ogg,.opus,.wav,.aac,.lrc" hidden />
+    <input type="file" id="folder-input" webkitdirectory multiple hidden />
+    <audio id="audio" preload="metadata"></audio>
+
+    <script type="module">
+      import { formatTime, lyricIndex, nameInfo, nextIndex, parseId3, parseLrc } from './player.js'
+
+      const $ = (id) => document.getElementById(id)
+      const audio = $('audio')
+      const AUDIO_EXT = /\.(mp3|flac|m4a|mp4|aac|ogg|oga|opus|wav|webm)$/i
+      const REPEAT_LABEL = { off: '반복 안 함', all: '전체 반복', one: '한 곡 반복' }
+
+      // ponytail: 재생 목록은 브라우저 File 객체라 패널을 다시 열면 사라진다. 경로 기억이 필요하면 worker로 디스크를 읽어야 한다.
+      let tracks = [] // { file, url, title, artist, lyrics, lrcFile, cover }
+      let current = -1
+      let lyrics = []
+      let lyricAt = -2
+      let syncOffset = 0
+      const prefs = { volume: 0.8, repeat: 'all', shuffle: false }
+
+      const icon = (el, name) => el.querySelector('use').setAttribute('href', `#i-${name}`)
+      const baseName = (name) => name.replace(/\.[^.]+$/, '').toLowerCase()
+      const savePrefs = () => orca.storage.set('prefs', prefs).catch(() => {})
+
+      async function readTags(track) {
+        if (track.tagged) return
+        track.tagged = true
+        try {
+          // ID3v2는 파일 앞에 있어서 앞부분만 읽는다. 앨범아트가 크면 잘릴 수 있어 넉넉히 잡는다.
+          const head = await track.file.slice(0, 4 * 1024 * 1024).arrayBuffer()
+          const tags = parseId3(head)
+          if (tags.title) track.title = tags.title
+          if (tags.artist) track.artist = tags.artist
+          if (tags.lyrics && !track.lrcText) track.lrcText = tags.lyrics
+          if (tags.picture) track.cover = URL.createObjectURL(new Blob([tags.picture.data], { type: tags.picture.mime }))
+        } catch {}
+        if (track.lrcFile && !track.lrcLoaded) {
+          track.lrcLoaded = true
+          // 알송 등에서 받은 .lrc는 CP949인 경우가 많다. UTF-8로 깨지면 euc-kr로 다시 읽는다.
+          const bytes = await track.lrcFile.arrayBuffer()
+          const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+          track.lrcText = utf8.includes('�') ? new TextDecoder('euc-kr').decode(bytes) : utf8
+        }
+      }
+
+      function addFiles(fileList) {
+        const files = [...fileList]
+        const lrcs = new Map(files.filter((f) => /\.lrc$/i.test(f.name)).map((f) => [baseName(f.name), f]))
+        const fresh = files
+          .filter((f) => AUDIO_EXT.test(f.name))
+          .sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name, 'ko'))
+          .map((file) => ({ file, url: URL.createObjectURL(file), ...nameInfo(file.name), lrcFile: lrcs.get(baseName(file.name)) }))
+        // 이미 있는 곡에 맞는 .lrc만 따로 넣은 경우
+        for (const t of tracks) {
+          const lrc = lrcs.get(baseName(t.file.name))
+          if (lrc && !t.lrcFile) Object.assign(t, { lrcFile: lrc, lrcLoaded: false, tagged: false })
+        }
+        tracks.push(...fresh)
+        renderList()
+        if (current === -1 && fresh.length) play(tracks.length - fresh.length)
+        else if (current >= 0 && lrcs.has(baseName(tracks[current].file.name))) showTrack()
+        fresh.forEach((t) => readTags(t).then(renderList))
+      }
+
+      async function play(index) {
+        if (index < 0 || index >= tracks.length) return
+        current = index
+        audio.src = tracks[index].url
+        audio.play().catch(() => {})
+        await showTrack()
+      }
+
+      async function showTrack() {
+        const t = tracks[current]
+        await readTags(t)
+        if (tracks[current] !== t) return
+        $('title').textContent = t.title
+        $('artist').textContent = t.artist || '알 수 없는 아티스트'
+        const box = $('cover-box')
+        box.replaceChildren()
+        if (t.cover) Object.assign(box.appendChild(document.createElement('img')), { src: t.cover, alt: '', className: 'cover' })
+        else box.innerHTML = '<svg><use href="#i-music" /></svg>'
+        lyrics = t.lrcText ? parseLrc(t.lrcText) : []
+        syncOffset = 0
+        renderLyrics(t.lrcText)
+        renderList()
+        if ('mediaSession' in navigator) {
+          navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist, artwork: t.cover ? [{ src: t.cover }] : [] })
+        }
+      }
+
+      function renderLyrics(raw) {
+        const box = $('lyrics')
+        lyricAt = -2
+        $('sync').hidden = !lyrics.length
+        $('sync-value').textContent = '0.0초'
+        if (!lyrics.length) {
+          // 시각 태그 없는 일반 가사는 그대로 보여준다.
+          const p = Object.assign(document.createElement('p'), { className: 'empty' })
+          p.style.whiteSpace = 'pre-wrap'
+          p.textContent = raw?.trim() || '가사 없음\n같은 이름의 .lrc 파일을 함께 추가하세요'
+          box.replaceChildren(p)
+          box.scrollTop = 0
+          return
+        }
+        box.replaceChildren(
+          ...lyrics.map((entry, i) => {
+            const div = Object.assign(document.createElement('div'), { className: 'line' })
+            div.dataset.i = i
+            for (const line of entry.lines.length ? entry.lines : ['♪']) div.appendChild(document.createElement('span')).textContent = line
+            return div
+          })
+        )
+        box.scrollTop = 0
+        syncLyrics()
+      }
+
+      function syncLyrics() {
+        const i = lyricIndex(lyrics, audio.currentTime + syncOffset)
+        if (i === lyricAt) return
+        const box = $('lyrics')
+        box.children[lyricAt]?.classList.remove('current')
+        lyricAt = i
+        const el = box.children[i]
+        if (!el) return
+        el.classList.add('current')
+        box.scrollTop = el.offsetTop - box.clientHeight / 2 + el.offsetHeight / 2
+      }
+
+      function renderList() {
+        $('count').textContent = tracks.length ? `재생 목록 (${tracks.length})` : '재생 목록'
+        const list = $('playlist')
+        if (!tracks.length) {
+          list.innerHTML = '<p class="hint">+ 버튼이나 폴더 버튼으로 음악을 추가하거나<br />파일을 이 패널에 끌어다 놓으세요.</p>'
+          return
+        }
+        list.replaceChildren(
+          ...tracks.map((t, i) => {
+            const li = document.createElement('li')
+            li.dataset.i = i
+            li.className = i === current ? 'playing' : ''
+            li.title = t.file.webkitRelativePath || t.file.name
+            li.innerHTML = '<span class="no"></span><span class="name"></span><button class="icon" title="목록에서 빼기"><svg><use href="#i-x" /></svg></button>'
+            li.querySelector('.no').textContent = i === current && !audio.paused ? '♪' : i + 1
+            li.querySelector('.name').textContent = t.artist ? `${t.artist} - ${t.title}` : t.title
+            if (t.lrcText || t.lrcFile) li.querySelector('.name').insertAdjacentHTML('afterend', '<span class="lrc">LRC</span>')
+            return li
+          })
+        )
+      }
+
+      function removeTrack(i) {
+        const [gone] = tracks.splice(i, 1)
+        URL.revokeObjectURL(gone.url)
+        if (gone.cover) URL.revokeObjectURL(gone.cover)
+        if (i === current) {
+          audio.pause()
+          audio.removeAttribute('src')
+          current = -1
+          if (tracks.length) play(Math.min(i, tracks.length - 1))
+          else resetNow()
+        } else if (i < current) current--
+        renderList()
+      }
+
+      function resetNow() {
+        $('title').textContent = '재생할 곡을 추가하세요'
+        $('artist').textContent = '파일을 끌어다 놓아도 됩니다'
+        $('cover-box').innerHTML = '<svg><use href="#i-music" /></svg>'
+        lyrics = []
+        renderLyrics('')
+        $('seek').max = 0
+        $('pos').textContent = $('dur').textContent = '0:00'
+      }
+
+      const step = (dir) => {
+        if (current < 0) return
+        // 3초 넘게 들었으면 이전 버튼은 곡 처음으로 (알송, 대부분의 플레이어와 같다)
+        if (dir < 0 && audio.currentTime > 3) return void (audio.currentTime = 0)
+        play(nextIndex(current, tracks.length, { ...prefs, step: dir }))
+      }
+      const toggle = () => {
+        if (current < 0) return tracks.length && play(0)
+        audio.paused ? audio.play().catch(() => {}) : audio.pause()
+      }
+
+      function applyPrefs() {
+        audio.volume = prefs.volume
+        $('volume').value = prefs.volume
+        $('shuffle').setAttribute('aria-pressed', prefs.shuffle)
+        const rep = $('repeat')
+        rep.setAttribute('aria-pressed', prefs.repeat !== 'off')
+        rep.dataset.badge = prefs.repeat === 'one' ? '1' : ''
+        rep.title = REPEAT_LABEL[prefs.repeat]
+      }
+
+      // 이벤트
+      $('add-files').onclick = () => $('file-input').click()
+      $('add-folder').onclick = () => $('folder-input').click()
+      for (const id of ['file-input', 'folder-input']) {
+        $(id).onchange = (e) => {
+          addFiles(e.target.files)
+          e.target.value = ''
+        }
+      }
+      $('clear').onclick = () => {
+        while (tracks.length) removeTrack(tracks.length - 1)
+      }
+      $('play').onclick = toggle
+      $('prev').onclick = () => step(-1)
+      $('next').onclick = () => step(1)
+      $('shuffle').onclick = () => {
+        prefs.shuffle = !prefs.shuffle
+        applyPrefs()
+        savePrefs()
+      }
+      $('repeat').onclick = () => {
+        prefs.repeat = { off: 'all', all: 'one', one: 'off' }[prefs.repeat]
+        applyPrefs()
+        savePrefs()
+      }
+      $('volume').oninput = (e) => {
+        prefs.volume = Number(e.target.value)
+        audio.volume = prefs.volume
+        audio.muted = false
+      }
+      $('volume').onchange = savePrefs
+      $('mute').onclick = () => (audio.muted = !audio.muted)
+      $('seek').oninput = (e) => (audio.currentTime = Number(e.target.value))
+      $('sync-minus').onclick = () => shiftSync(0.5)
+      $('sync-plus').onclick = () => shiftSync(-0.5)
+      function shiftSync(delta) {
+        syncOffset = Math.round((syncOffset + delta) * 10) / 10
+        $('sync-value').textContent = `${syncOffset > 0 ? '-' : syncOffset < 0 ? '+' : ''}${Math.abs(syncOffset).toFixed(1)}초`
+        syncLyrics()
+      }
+
+      $('lyrics').onclick = (e) => {
+        const line = e.target.closest('.line')
+        if (line) audio.currentTime = Math.max(0, lyrics[line.dataset.i].time - syncOffset)
+      }
+      $('playlist').onclick = (e) => {
+        const li = e.target.closest('li')
+        if (!li) return
+        if (e.target.closest('button')) removeTrack(Number(li.dataset.i))
+        else play(Number(li.dataset.i))
+      }
+
+      audio.onplay = audio.onpause = () => {
+        icon($('play'), audio.paused ? 'play' : 'pause')
+        $('play').title = audio.paused ? '재생' : '일시정지'
+        renderList()
+      }
+      audio.onvolumechange = () => icon($('mute'), audio.muted || audio.volume === 0 ? 'mute' : 'vol')
+      audio.onloadedmetadata = () => {
+        $('seek').max = audio.duration || 0
+        $('dur').textContent = formatTime(audio.duration)
+      }
+      audio.ontimeupdate = () => {
+        if (document.activeElement !== $('seek')) $('seek').value = audio.currentTime
+        $('pos').textContent = formatTime(audio.currentTime)
+        syncLyrics()
+      }
+      audio.onended = () => {
+        const next = nextIndex(current, tracks.length, { ...prefs, auto: true })
+        if (next === -1) return
+        if (next === current) {
+          audio.currentTime = 0
+          audio.play().catch(() => {})
+        } else play(next)
+      }
+      audio.onerror = () => {
+        if (current >= 0) $('artist').textContent = '이 형식은 재생할 수 없습니다'
+      }
+
+      document.addEventListener('keydown', (e) => {
+        if (e.target.matches('input')) return
+        if (e.code === 'Space') toggle()
+        else if (e.key === 'ArrowLeft') audio.currentTime -= 5
+        else if (e.key === 'ArrowRight') audio.currentTime += 5
+        else return
+        e.preventDefault()
+      })
+
+      let dragDepth = 0
+      document.addEventListener('dragenter', (e) => {
+        e.preventDefault()
+        dragDepth++
+        document.body.classList.add('dragging')
+      })
+      document.addEventListener('dragleave', () => {
+        if (--dragDepth <= 0) document.body.classList.remove('dragging')
+      })
+      document.addEventListener('dragover', (e) => e.preventDefault())
+      document.addEventListener('drop', (e) => {
+        e.preventDefault()
+        dragDepth = 0
+        document.body.classList.remove('dragging')
+        addFiles(e.dataTransfer.files)
+      })
+
+      if ('mediaSession' in navigator) {
+        const actions = { play: toggle, pause: toggle, previoustrack: () => step(-1), nexttrack: () => step(1) }
+        for (const [name, fn] of Object.entries(actions)) {
+          try {
+            navigator.mediaSession.setActionHandler(name, fn)
+          } catch {}
+        }
+      }
+
+      renderList()
+      applyPrefs()
+      orca.storage
+        .get('prefs')
+        .then((saved) => {
+          if (saved && typeof saved === 'object') Object.assign(prefs, saved)
+          applyPrefs()
+        })
+        .catch(() => {})
+    </script>
+  </body>
+</html>
