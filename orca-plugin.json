@@ -3,13 +3,14 @@
   "id": "music-player",
   "name": "뮤직 플레이어",
   "version": "0.1.0",
-  "description": "알송처럼 가사 싱크를 보여주는 음악 플레이어를 Orca 사이드바에서 씁니다.",
+  "description": "알송처럼 가사 싱크를 보여주는 음악 플레이어와 유튜브 바로가기를 Orca 사이드바에서 씁니다.",
   "icon": "icon.png",
   "engines": {
     "orca": ">=1.4.248"
   },
-  "execution": "sandboxed-ui",
+  "execution": "trusted-worker",
   "pluginApi": 1,
+  "main": "worker.mjs",
   "contributes": {
     "panels": [
       {
