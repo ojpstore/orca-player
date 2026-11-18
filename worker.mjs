@@ -1,8 +1,8 @@
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { mkdir, open as openFile, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'])
 
@@ -94,7 +94,7 @@ const LOCAL_APP_DATA = process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'L
 const OWN_YTDLP = join(LOCAL_APP_DATA, 'orca-music-player', 'yt-dlp.exe')
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
 const VIDEO_DIR = join(tmpdir(), 'orca-music-player')
-export const CHUNK_BYTES = 512 * 1024 // 응답 한도 1 MiB, base64로 4/3배가 된다.
+export const CHUNK_BYTES = 750 * 1024 // 응답 한도 1 MiB, base64로 4/3배(약 1000KB)가 된다. 클수록 요청 수가 준다. 패널의 MUSIC_CHUNK와 같아야 한다.
 
 // winget은 PATH를 바꾸지만 Orca를 다시 켜기 전엔 worker에 반영되지 않아 설치 폴더도 직접 본다.
 export function findYtDlp({ env = process.env, exists = existsSync, list = readdirSync } = {}) {
@@ -103,6 +103,19 @@ export function findYtDlp({ env = process.env, exists = existsSync, list = readd
   const packages = join(LOCAL_APP_DATA, 'Microsoft', 'WinGet', 'Packages')
   try {
     for (const name of list(packages)) if (name.startsWith('yt-dlp.yt-dlp')) candidates.push(join(packages, name, 'yt-dlp.exe'))
+  } catch {}
+  return candidates.find((path) => exists(path)) ?? null
+}
+
+// yt-dlp와 같은 방식으로 PATH, 없으면 winget 설치 폴더에서 ffmpeg.exe를 찾는다.
+export function findFfmpeg({ env = process.env, exists = existsSync, list = readdirSync } = {}) {
+  const candidates = (env.PATH ?? env.Path ?? '').split(';').filter(Boolean).map((dir) => join(dir, 'ffmpeg.exe'))
+  const packages = join(LOCAL_APP_DATA, 'Microsoft', 'WinGet', 'Packages')
+  try {
+    for (const name of list(packages)) {
+      if (!/ffmpeg/i.test(name)) continue
+      for (const sub of list(join(packages, name))) candidates.push(join(packages, name, sub, 'bin', 'ffmpeg.exe'))
+    }
   } catch {}
   return candidates.find((path) => exists(path)) ?? null
 }
@@ -127,11 +140,15 @@ export function ytDlpError(stderr) {
 
 // signal로 중단하면 spawn이 yt-dlp를 죽이고 AbortError로 끝난다.
 function downloadVideo(ytdlp, id, file, onProgress, signal) {
+  const ffmpeg = findFfmpeg()
+  if (!ffmpeg) return Promise.reject(new Error('ffmpeg가 필요합니다. 터미널에서 `winget install Gyan.FFmpeg` 실행 후 Orca를 다시 켜 주세요.'))
   const args = [
     // 회사 SSL 검사 인증서처럼 Windows에만 등록된 루트 인증서도 믿도록 OS 인증서 저장소를 쓴다.
     '--compat-options', 'no-certifi',
-    // 18 = 360p 영상+소리 한 파일. ffmpeg 없이 바로 재생된다.
-    '-f', '18/b[ext=mp4][height<=480]/b[ext=mp4]',
+    // 유튜브가 영상+소리 한 파일 포맷(18)을 없애서 영상(avc1)+소리(m4a)를 ffmpeg로 합친다.
+    '-f', 'bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]/b[ext=mp4]',
+    '--merge-output-format', 'mp4',
+    '--ffmpeg-location', ffmpeg,
     '--no-playlist', '--newline', '--force-overwrites',
     '-o', file,
     `https://www.youtube.com/watch?v=${id}`
@@ -206,13 +223,161 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
     try {
       const buffer = Buffer.alloc(Math.min(CHUNK_BYTES, current.size - offset))
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
-      return { data: buffer.subarray(0, bytesRead).toString('base64') }
-    } finally {
+      const data = buffer.subarray(0, bytesRead).toString('base64')
+      // 마지막 조각까지 패널에 넘겼으면 패널이 blob으로 들고 있으므로 임시 파일은 지운다.
+      const last = offset + bytesRead >= current.size
       await handle.close()
+      if (last) {
+        const { file } = current
+        current = null
+        await discard(file)
+      }
+      return { data }
+    } finally {
+      await handle.close().catch(() => {})
     }
   }
 
   return { fetch: fetchVideo, chunk }
+}
+
+// --- 음악 폴더 고르기: 패널(브라우저)의 폴더 선택 창 대신 윈도 기본 폴더 트리 창을 띄운다.
+// 패널은 디스크를 못 읽어서 곡 목록만 넘기고, 곡 내용은 재생할 때 조각으로 읽어 간다.
+
+const MUSIC_FILE = /\.(mp3|flac|m4a|mp4|aac|ogg|oga|opus|wav|webm|lrc)$/i
+const library = [] // 패널이 읽을 수 있는 파일 목록. 목록에 있는 번호로만 읽게 해서 임의 경로 읽기를 막는다.
+
+const PICK_FOLDER = `Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text; using System.Threading;
+public class OrcaPick {
+  public delegate int Callback(IntPtr hwnd, uint msg, IntPtr lParam, IntPtr lpData);
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+  public struct BROWSEINFO { public IntPtr hwndOwner; public IntPtr pidlRoot; public IntPtr pszDisplayName; public string lpszTitle; public uint ulFlags; public Callback lpfn; public IntPtr lParam; public int iImage; }
+  [DllImport("shell32.dll", CharSet = CharSet.Auto)] static extern IntPtr SHBrowseForFolder(ref BROWSEINFO bi);
+  [DllImport("shell32.dll", CharSet = CharSet.Auto)] static extern bool SHGetPathFromIDList(IntPtr pidl, StringBuilder path);
+  [DllImport("ole32.dll")] static extern void CoTaskMemFree(IntPtr p);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, string l);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, StringBuilder l);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string cls, string title);
+  static volatile bool done;
+  static readonly Callback cb = Watch;
+  // 입력칸에 \\서버 같은 네트워크 경로를 치고 잠시 멈추면 트리가 그 위치로 이동한다. 그 아래 공유 폴더는 트리를 펼쳐 고른다.
+  static int Watch(IntPtr hwnd, uint msg, IntPtr lParam, IntPtr data) {
+    if (msg != 1) return 0; // BFFM_INITIALIZED
+    new Thread(() => {
+      IntPtr edit = FindWindowEx(hwnd, IntPtr.Zero, "Edit", null);
+      string last = "", handled = "";
+      while (!done && edit != IntPtr.Zero) {
+        Thread.Sleep(300);
+        var sb = new StringBuilder(1040);
+        SendMessage(edit, 0xD, (IntPtr)1040, sb); // WM_GETTEXT
+        string text = sb.ToString().Trim();
+        if (text == last && text != handled && text.StartsWith(@"\\\\")) {
+          handled = text;
+          SendMessage(hwnd, 0x467, (IntPtr)1, text); // BFFM_SETSELECTIONW
+        }
+        last = text;
+      }
+    }) { IsBackground = true }.Start();
+    return 0;
+  }
+  public static string Show(IntPtr owner, string title) {
+    IntPtr name = Marshal.AllocHGlobal(1040);
+    done = false;
+    // 0x1 폴더만, 0x10 경로 입력칸, 0x40 새 대화상자 스타일
+    var bi = new BROWSEINFO { hwndOwner = owner, pszDisplayName = name, lpszTitle = title, ulFlags = 0x1 | 0x10 | 0x40, lpfn = cb };
+    IntPtr pidl = SHBrowseForFolder(ref bi);
+    done = true;
+    Marshal.FreeHGlobal(name);
+    if (pidl == IntPtr.Zero) return null;
+    var sb = new StringBuilder(1040);
+    string path = SHGetPathFromIDList(pidl, sb) ? sb.ToString() : null;
+    CoTaskMemFree(pidl);
+    return path;
+  }
+}
+'@
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$o = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; Opacity = 0 }
+$o.Show()
+$path = [OrcaPick]::Show($o.Handle, '음악 폴더를 선택하세요. 아래 칸에 \\\\서버 같은 네트워크 경로를 입력해도 됩니다.')
+$o.Close()
+if ($path) { $path }`
+
+// C# 컴파일이 막힌 PC(보안 정책 등)용. 경로 입력칸은 없지만 같은 폴더 트리 창이다.
+const PICK_FOLDER_PLAIN = `Add-Type -AssemblyName System.Windows.Forms
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = '음악 폴더를 선택하세요'
+$o = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
+if ($d.ShowDialog($o) -eq 'OK') { $d.SelectedPath }`
+
+const runPowerShell = (script) =>
+  new Promise((resolve, reject) =>
+    execFile('powershell.exe', ['-NoProfile', '-STA', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', windowsHide: true }, (error, stdout) =>
+      error ? reject(error) : resolve(stdout.trim() || null)
+    )
+  )
+
+// 취소하면 null. Windows PowerShell 5.1이 필요하다. 입력칸 있는 창이 실패하면 입력칸 없는 창으로 다시 시도한다.
+export const pickFolder = (run = runPowerShell) => run(PICK_FOLDER).catch(() => run(PICK_FOLDER_PLAIN))
+
+// 폴더 안의 음악/.lrc 파일. path는 패널 목록에 보일 "폴더이름/하위경로"다.
+// 권한이 없는 폴더(System Volume Information 등)는 건너뛴다. 하나 실패한다고 전체를 버리지 않는다.
+export function listMusic(root, files = library) {
+  const out = []
+  const walk = (dir, rel) => {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name)
+      const path = `${rel}/${entry.name}`
+      if (entry.isDirectory()) walk(full, path)
+      else if (MUSIC_FILE.test(entry.name)) {
+        try {
+          out.push({ id: files.push(full) - 1, path, size: statSync(full).size })
+        } catch {}
+      }
+    }
+  }
+  walk(root, basename(root) || root.replace(/[:\/]+$/, ''))
+  return out
+}
+
+export async function readMusic(id, offset = 0, files = library) {
+  const file = files[id]
+  if (!file) return { error: '목록에 없는 파일입니다.' }
+  const handle = await openFile(file, 'r')
+  try {
+    const { size } = await handle.stat()
+    const buffer = Buffer.alloc(Math.max(0, Math.min(CHUNK_BYTES, size - offset)))
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
+    return { data: buffer.subarray(0, bytesRead).toString('base64') }
+  } finally {
+    await handle.close()
+  }
+}
+
+// 창이 열려 있는 동안 패널 요청(최대 2분)이 끝나지 않게, 오래 걸리면 pending을 돌려 다시 묻게 한다.
+let pick = null
+async function pickMusic(wait = 90000) {
+  if (!pick) {
+    const me = (pick = { result: null })
+    me.promise = pickFolder().then(
+      (root) => (me.result = root ? { files: listMusic(root) } : { cancelled: true }),
+      (error) => (me.result = { error: error.message })
+    )
+  }
+  const me = pick
+  await Promise.race([me.promise, new Promise((resolve) => setTimeout(resolve, wait))])
+  if (!me.result) return { pending: true }
+  pick = null
+  return me.result
 }
 
 // worker는 Orca.exe로 실행되므로 그 옆의 번들 CLI를 먼저 쓴다.
@@ -291,6 +456,9 @@ export default function activate(plugin) {
       return { error: error.message }
     }
   })
+
+  plugin.panels.handle('music.pickFolder', () => pickMusic())
+  plugin.panels.handle('music.read', ({ id, offset } = {}) => readMusic(id, offset))
 
   plugin.panels.handle('youtube.status', () => ({ ytdlp: findYtDlp() }))
   plugin.panels.handle('youtube.install', async () => {

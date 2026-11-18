@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cliResult, findYtDlp, isYoutubeUrl, parseSearch, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
+import { pickFolder, listMusic, readMusic, cliResult, findYtDlp, isYoutubeUrl, parseSearch, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
 
 // 손으로 끝낼 수 있는 가짜 yt-dlp. finish(내용)이면 파일을 쓰고 성공, fail()이면 실패한다.
 async function fakeFetcher() {
@@ -52,6 +52,8 @@ test('A→B→A: 첫 A가 먼저 끝나도 두 번째 A가 끝나기 전엔 준�
   assert.equal(await readFile(runs[2].file, 'utf8'), 'new!')
   assert.equal(existsSync(runs[0].file), false)
   assert.equal(Buffer.from((await videos.chunk(A)).data, 'base64').toString(), 'new!')
+  assert.equal(existsSync(runs[2].file), false) // 마지막 조각까지 넘기면 임시 파일을 지운다.
+  assert.deepEqual(await videos.chunk(A), { error: '받아 둔 영상이 바뀌었습니다.' })
 })
 
 test('다운로드 실패는 오류로 알리고 다시 누르면 새로 받는다', async () => {
@@ -120,4 +122,27 @@ test('yt-dlp는 PATH, winget 폴더 순으로 찾는다', () => {
 test('yt-dlp 오류 메시지', () => {
   assert.match(ytDlpError('WARNING: x\nERROR: [youtube] a: Failed to extract any player response; please report'), /차단/)
   assert.equal(ytDlpError('ERROR: Video unavailable'), 'Video unavailable')
+})
+
+test('음악 폴더는 음악/lrc만 목록에 넣고, 목록에 있는 번호만 읽게 한다', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'orca-music-'))
+  await mkdir(join(root, 'sub'))
+  await writeFile(join(root, 'sub', 'a.mp3'), 'abc')
+  await writeFile(join(root, 'sub', 'a.lrc'), '[00:01.00]x')
+  await writeFile(join(root, 'memo.txt'), 'no')
+  const files = []
+  const list = listMusic(root, files)
+  assert.deepEqual(list.map((f) => [f.path.replace(/^[^/]+\//, ''), f.size]).sort(), [['sub/a.lrc', 11], ['sub/a.mp3', 3]])
+  const mp3 = list.find((f) => f.path.endsWith('.mp3'))
+  assert.equal(Buffer.from((await readMusic(mp3.id, 0, files)).data, 'base64').toString(), 'abc')
+  assert.equal((await readMusic(mp3.id, 3, files)).data, '')
+  assert.ok((await readMusic(99, 0, files)).error)
+})
+
+test('입력칸 있는 폴더 창이 실패하면 기본 폴더 창으로 다시 시도한다', async () => {
+  const calls = []
+  const run = async (script) => (calls.push(script), calls.length === 1 ? Promise.reject(new Error('Add-Type 차단')) : 'D:\music')
+  assert.equal(await pickFolder(run), 'D:\music')
+  assert.equal(calls.length, 2)
+  assert.equal(await pickFolder(async () => null), null) // 취소는 다시 열지 않는다.
 })

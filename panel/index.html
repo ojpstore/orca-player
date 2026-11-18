@@ -36,11 +36,14 @@
       .artist { font-size: 12px; color: var(--orca-muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
       .lyrics {
-        position: relative; flex: none; height: 180px; overflow-y: auto; margin: 0 12px;
-        padding: 76px 8px; text-align: center; border: 1px solid var(--orca-border); border-radius: var(--radius);
+        height: 100%; overflow-y: auto; margin: 0;
+        padding: 0 8px; text-align: center; border: 1px solid var(--orca-border); border-radius: var(--radius);
         background: var(--orca-card); scroll-behavior: smooth;
         mask-image: linear-gradient(transparent, #000 18%, #000 82%, transparent);
       }
+      .lyrics::before, .lyrics::after { content: ''; display: block; height: calc(50% - 16px); }
+      .lyrics-wrap { position: relative; flex: none; height: 180px; margin: 0 12px; }
+      .lyrics-wrap .yt-screen { border-radius: var(--radius); }
       .lyrics .empty { color: var(--orca-muted-foreground); margin: 0; }
       .line { padding: 4px 2px; color: var(--orca-muted-foreground); cursor: pointer; border-radius: 4px; transition: color 0.2s, transform 0.2s; }
       .line:hover { background: var(--orca-accent); }
@@ -48,6 +51,9 @@
       .line span:first-child { font-size: 14px; }
       .line.current { color: var(--orca-foreground); font-weight: 600; transform: scale(1.04); }
       .line.current span:first-child { color: var(--hl); }
+      .grip { flex: none; height: 10px; margin: 0 12px; cursor: row-resize; touch-action: none; position: relative; }
+      .grip::after { content: ''; position: absolute; left: 50%; top: 4px; width: 36px; height: 3px; margin-left: -18px; border-radius: 2px; background: var(--orca-border); }
+      .grip:hover::after, .grip.drag::after { background: var(--hl); }
       .sync { display: flex; justify-content: flex-end; align-items: center; gap: 2px; margin: 2px 12px 0; font-size: 11px; color: var(--orca-muted-foreground); flex: none; }
       .sync button { padding: 0 6px; height: 20px; border-radius: 4px; }
       .sync button:hover { background: var(--orca-accent); }
@@ -98,8 +104,13 @@
         position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
         padding: 12px; text-align: center; font-size: 12px; color: var(--orca-muted-foreground); background: center / cover no-repeat var(--orca-card);
       }
-      .yt-screen.thumb { color: #fff; box-shadow: inset 0 0 0 100vmax rgb(0 0 0 / 0.6); }
+      .yt-screen.has-thumb { color: #fff; box-shadow: inset 0 0 0 100vmax rgb(0 0 0 / 0.6); }
       .yt-screen p { margin: 0; }
+      .yt-screen.busy { color: #fff; font-size: 13px; background: linear-gradient(110deg, #0b0b0b 30%, #1c1c1c 50%, #0b0b0b 70%) 0 0 / 300% 100%; box-shadow: none; animation: yt-shimmer 1.6s linear infinite; }
+      @keyframes yt-shimmer { to { background-position: -300% 0; } }
+      .yt-screen.busy .yt-spin { width: 56px; height: 56px; border-width: 4px; }
+      .yt-spin { width: 28px; height: 28px; border: 3px solid rgb(255 255 255 / 0.25); border-top-color: #fff; border-radius: 50%; animation: yt-spin 0.8s linear infinite; }
+      @keyframes yt-spin { to { transform: rotate(360deg); } }
       .yt-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
       .yt-actions button { height: 28px; padding: 0 12px; border-radius: var(--radius); font-size: 12px; font-weight: 600; color: #fff; background: rgb(255 255 255 / 0.18); }
       .yt-actions button.primary { background: linear-gradient(160deg, #ff5c8a, #7c4dff); }
@@ -147,7 +158,13 @@
       </div>
     </section>
 
-    <div class="lyrics" id="lyrics"></div>
+    <div class="lyrics-wrap" id="lyrics-wrap">
+      <div class="lyrics" id="lyrics"></div>
+      <div class="yt-screen busy" id="music-loading" hidden>
+        <div class="yt-spin"></div>
+        <p id="music-loading-msg"></p>
+      </div>
+    </div>
     <div class="sync" id="sync" hidden>
       <span>싱크</span>
       <button id="sync-minus" title="가사를 0.5초 빠르게">-0.5초</button>
@@ -173,6 +190,7 @@
       </div>
     </div>
 
+    <div class="grip" data-target="lyrics-wrap" data-min="80" title="끌어서 가사 높이 조절"></div>
     <div class="list-head">
       <h2 id="count">재생 목록</h2>
       <button class="icon" id="add-files" title="파일 추가 (음악, .lrc)"><svg><use href="#i-file" /></svg></button>
@@ -191,10 +209,12 @@
       <div class="yt-player" id="yt-player">
         <video id="yt-video" controls playsinline hidden></video>
         <div class="yt-screen" id="yt-screen">
+          <div class="yt-spin" id="yt-spin" hidden></div>
           <p id="yt-msg">검색 결과에서 영상을 누르면 여기에서 재생됩니다.</p>
           <div class="yt-actions" id="yt-actions"></div>
         </div>
       </div>
+      <div class="grip" data-target="yt-player" data-min="90" title="끌어서 플레이어 높이 조절"></div>
       <div class="list-head">
         <h2 id="yt-count">검색 결과</h2>
       </div>
@@ -202,7 +222,6 @@
     </div>
 
     <input type="file" id="file-input" multiple accept="audio/*,.mp3,.flac,.m4a,.ogg,.opus,.wav,.aac,.lrc" hidden />
-    <input type="file" id="folder-input" webkitdirectory multiple hidden />
     <audio id="audio" preload="metadata"></audio>
 
     <script type="module">
@@ -250,13 +269,86 @@
         } catch {}
       }
 
+      // 폴더 창으로 고른 곡은 worker가 디스크에서 읽는다. 곡 내용은 재생할 때만 받아 오고, File처럼 name/slice/arrayBuffer를 흉내 낸다.
+      const MUSIC_CHUNK = 750 * 1024
+      // 패널 요청은 10초에 120번까지라, 모든 곡 요청이 같은 간격표를 나눠 쓴다.
+      let nextSlot = 0
+      async function paceRequest() {
+        const at = Math.max(Date.now(), nextSlot)
+        nextSlot = at + 90
+        if (at > Date.now()) await sleep(at - Date.now())
+      }
+      class RemoteFile {
+        remote = true
+        constructor({ id, path, size }) {
+          this.id = id
+          this.size = size
+          this.webkitRelativePath = path
+          this.name = path.split('/').pop()
+        }
+        blob() {
+          return (this.cache ??= this.#load().catch((error) => ((this.cache = null), Promise.reject(error))))
+        }
+        async #load() {
+          // worker의 CHUNK_BYTES와 같아야 한다. 조각 번호로 여러 개를 동시에 요청하고, 요청 시작은 90ms 간격(초당 11번)으로 맞춘다.
+          const count = Math.ceil(this.size / MUSIC_CHUNK)
+          const parts = new Array(count)
+          let next = 0
+          let done = 0
+          const run = async () => {
+            while (next < count) {
+              if (this.cancelled) throw new Error('취소됨')
+              const i = next++
+              await paceRequest()
+              if (this.cancelled) throw new Error('취소됨')
+              const { data } = await request('music.read', { id: this.id, offset: i * MUSIC_CHUNK })
+              const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0))
+              if (bytes.length !== Math.min(MUSIC_CHUNK, this.size - i * MUSIC_CHUNK)) throw new Error('읽은 크기가 맞지 않습니다.')
+              parts[i] = bytes
+              this.onProgress?.(Math.floor((++done / count) * 100))
+            }
+          }
+          try {
+            await Promise.all([run(), run(), run()])
+          } catch (error) {
+            next = count // 나머지 요청도 멈춘다.
+            throw error
+          }
+          return new Blob(parts)
+        }
+        // 목록에서 뺀 곡은 읽던 것을 멈추고 메모리도 비운다.
+        cancel() {
+          this.cancelled = true
+          this.cache = null
+        }
+        slice(start, end) {
+          return { arrayBuffer: async () => (await this.blob()).slice(start, end).arrayBuffer() }
+        }
+        arrayBuffer = async () => (await this.blob()).arrayBuffer()
+      }
+
+      async function pickFolder() {
+        $('add-folder').disabled = true
+        try {
+          let result
+          do result = await request('music.pickFolder', {}, 110000)
+          while (result.pending)
+          if (result.files?.length) addFiles(result.files.map((f) => new RemoteFile(f)))
+          else if (result.files) $('artist').textContent = '그 폴더에는 음악 파일이 없습니다.'
+        } catch (error) {
+          $('artist').textContent = `폴더를 열지 못했습니다: ${error.message}`
+        } finally {
+          $('add-folder').disabled = false
+        }
+      }
+
       function addFiles(fileList) {
         const files = [...fileList]
         const lrcFor = lrcMatcher(files.filter((f) => /\.lrc$/i.test(f.name)))
         const fresh = files
           .filter((f) => AUDIO_EXT.test(f.name))
           .sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name, 'ko'))
-          .map((file) => ({ file, url: URL.createObjectURL(file), ...nameInfo(file.name), lrcFile: lrcFor(file) }))
+          .map((file) => ({ file, url: file.remote ? null : URL.createObjectURL(file), ...nameInfo(file.name), lrcFile: lrcFor(file) }))
         // 이미 있는 곡에 맞는 .lrc만 따로 넣은 경우: 태그를 읽었거나 읽는 중이면 그 뒤에 가사만 이어 읽는다.
         for (const t of tracks) {
           const lrc = lrcFor(t.file)
@@ -268,15 +360,60 @@
         renderList()
         if (current === -1 && fresh.length) play(tracks.length - fresh.length)
         else if (current >= 0 && lrcFor(tracks[current].file)) showTrack()
-        fresh.forEach((t) => readTags(t).then(renderList))
+        // 폴더 창으로 고른 곡은 태그를 읽으려면 곡을 통째로 받아야 해서, 재생할 때 읽는다.
+        fresh.filter((t) => !t.file.remote).forEach((t) => readTags(t).then(renderList))
       }
 
       async function play(index) {
         if (index < 0 || index >= tracks.length) return
+        const prev = tracks[current]
         current = index
-        audio.src = tracks[index].url
+        $('music-loading').hidden = true // 이전 곡의 로딩 화면이 남지 않게 한다.
+        const t = tracks[index]
+        if (t.file.remote) {
+          // 한 곡만 메모리에 두고, 다른 곡으로 넘어가면 이전 곡 데이터는 버린다.
+          if (prev?.file.remote && prev !== t) {
+            URL.revokeObjectURL(prev.url)
+            prev.url = null
+            prev.file.cache = null
+          }
+          if (!t.url) {
+            audio.pause()
+            $('title').textContent = t.title
+            $('artist').textContent = '곡을 불러오는 중…'
+            const showLoading = (percent) => {
+              $('music-loading').hidden = false
+              $('music-loading-msg').textContent = `곡을 불러오는 중 ${percent}%`
+            }
+            showLoading(0)
+            t.file.onProgress = (percent) => current === index && showLoading(percent)
+            try {
+              const url = URL.createObjectURL(await t.file.blob())
+              if (current !== index || tracks[index] !== t) return void (URL.revokeObjectURL(url), (t.file.cache = null))
+              t.url = url
+            } catch (error) {
+              if (current === index && tracks[index] === t) $('artist').textContent = `곡을 읽지 못했습니다: ${error.message}`
+              return
+            } finally {
+              t.file.onProgress = null
+              if ((current === index && tracks[index] === t) || current < 0) $('music-loading').hidden = true
+            }
+          }
+        }
+        audio.src = t.url
+        prefetchNext()
         audio.play().catch(() => {})
         await showTrack()
+      }
+
+      // 다음 곡(셔플이면 건너뜀)을 미리 받아 두면 넘어갈 때 바로 재생된다. 한 곡만 미리 받는다.
+      let prefetched = null
+      function prefetchNext() {
+        if (prefs.shuffle) return
+        const next = tracks[nextIndex(current, tracks.length, { repeat: prefs.repeat })]
+        if (prefetched && prefetched !== next && prefetched !== tracks[current]) prefetched.file.cache = null
+        prefetched = next?.file.remote && next !== tracks[current] ? next : null
+        prefetched?.file.blob().catch(() => {})
       }
 
       async function showTrack() {
@@ -363,6 +500,7 @@
 
       function removeTrack(i) {
         const [gone] = tracks.splice(i, 1)
+        gone.file.cancel?.()
         URL.revokeObjectURL(gone.url)
         if (gone.cover) URL.revokeObjectURL(gone.cover)
         if (i === current) {
@@ -376,6 +514,7 @@
       }
 
       function resetNow() {
+        $('music-loading').hidden = true
         $('title').textContent = '재생할 곡을 추가하세요'
         $('artist').textContent = '파일을 끌어다 놓아도 됩니다'
         $('cover-box').innerHTML = '<svg><use href="#i-music" /></svg>'
@@ -408,15 +547,25 @@
 
       // 이벤트
       $('add-files').onclick = () => $('file-input').click()
-      $('add-folder').onclick = () => $('folder-input').click()
-      for (const id of ['file-input', 'folder-input']) {
+      $('add-folder').onclick = pickFolder
+      for (const id of ['file-input']) {
         $(id).onchange = (e) => {
           addFiles(e.target.files)
           e.target.value = ''
         }
       }
       $('clear').onclick = () => {
-        while (tracks.length) removeTrack(tracks.length - 1)
+        for (const t of tracks) {
+          t.file.cancel?.()
+          URL.revokeObjectURL(t.url)
+          if (t.cover) URL.revokeObjectURL(t.cover)
+        }
+        tracks = []
+        current = -1
+        audio.pause()
+        audio.removeAttribute('src')
+        resetNow()
+        renderList()
       }
       $('play').onclick = toggle
       $('prev').onclick = () => step(-1)
@@ -530,21 +679,32 @@
       let playing = null // 지금 재생(준비) 중인 영상
       let videoUrl = null
       const video = $('yt-video')
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
       const request = async (name, input, timeoutMs = 30000) => {
-        const { output } = await orca.host.call('plugin.request', { name, input, timeoutMs })
-        if (output?.error) throw new Error(output.error)
-        return output
+        // Orca는 패널 요청을 10초에 120번으로 제한한다. 걸리면 알려준 시간만큼 쉬었다 다시 보낸다.
+        for (let tries = 0; ; tries++) {
+          try {
+            const { output } = await orca.host.call('plugin.request', { name, input, timeoutMs })
+            if (output?.error) throw new Error(output.error)
+            return output
+          } catch (error) {
+            if (tries >= 20 || !(error?.code === 'rate_limited' || /너무 많|too many/i.test(error?.message ?? ''))) throw error
+            await sleep(error.retryAfterMs ?? 1000)
+          }
+        }
       }
       function setStatus(message, error = false) {
         $('yt-status').className = error ? 'yt-status error' : 'yt-status'
         $('yt-status').textContent = message
       }
       // 플레이어 자리에 안내 화면을 띄운다. actions: [{ label, primary, run }]
-      function screen(message, actions = [], thumb = playing?.thumb) {
+      function screen(message, actions = [], thumb = playing?.thumb, busy = false) {
         const el = $('yt-screen')
         el.hidden = false
-        el.classList.toggle('thumb', Boolean(thumb))
-        el.style.backgroundImage = thumb ? `url("${thumb}")` : ''
+        el.classList.toggle('has-thumb', Boolean(thumb) && !busy)
+        el.style.backgroundImage = thumb && !busy ? `url("${thumb}")` : ''
+        el.classList.toggle('busy', busy)
+        $('yt-spin').hidden = !busy
         $('yt-msg').textContent = message
         $('yt-actions').replaceChildren(
           ...actions.map(({ label, primary, run }) => {
@@ -554,6 +714,7 @@
           })
         )
       }
+      const loading = (message) => screen(message, [], playing?.thumb, true)
       const openInTab = (v) => ({
         label: '브라우저 탭으로 열기',
         run: async () => {
@@ -590,7 +751,7 @@
         renderVideos()
         video.pause()
         video.hidden = true
-        screen('준비 중…')
+        loading('준비 중…')
         try {
           // 요청은 최대 2분이라, 다운로드가 길면 worker가 pending을 돌려주고 다시 묻는다.
           let result
@@ -606,9 +767,10 @@
             if (playing !== v) return
             const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0))
             if (!bytes.length) break
+            await sleep(100) // ponytail: 고정 간격. 10초 120회 제한(초당 12회) 아래로 맞춘다.
             parts.push(bytes)
             offset += bytes.length
-            screen(`불러오는 중 ${Math.floor((offset / size) * 100)}%`)
+            loading(`불러오는 중 ${Math.floor((offset / size) * 100)}%`)
           }
           if (videoUrl) URL.revokeObjectURL(videoUrl)
           videoUrl = URL.createObjectURL(new Blob(parts, { type: 'video/mp4' }))
@@ -627,7 +789,7 @@
             primary: true,
             run: async (e) => {
               e.target.disabled = true
-              screen('yt-dlp 받는 중… (약 18MB)')
+              loading('yt-dlp 받는 중… (약 18MB)')
               try {
                 await request('youtube.install', {}, 120000)
                 playVideo(v)
@@ -640,7 +802,7 @@
         ])
       }
       orca.plugin?.on?.('youtube.progress', ({ id, percent }) => {
-        if (id === playing?.id && video.hidden) screen(`유튜브에서 받는 중 ${percent}%`)
+        if (id === playing?.id && video.hidden) loading(`유튜브에서 받는 중 ${percent}%`)
       })
       // 음악과 유튜브가 겹쳐 나오지 않게 한쪽이 재생되면 다른 쪽을 멈춘다.
       video.addEventListener('play', () => audio.pause())
@@ -695,6 +857,30 @@
           applyPrefs()
         })
         .catch(() => {})
+
+      // 가사/플레이어 아래 손잡이를 끌어 높이를 바꾸고, 다음에 열 때도 유지한다.
+      for (const grip of document.querySelectorAll('.grip')) {
+        const el = $(grip.dataset.target)
+        const key = `orca-music-player:h:${grip.dataset.target}`
+        const apply = (h) => {
+          const max = Math.max(Number(grip.dataset.min), window.innerHeight - 200)
+          el.style.flex = 'none'
+          el.style.height = `${Math.min(max, Math.max(Number(grip.dataset.min), h))}px`
+        }
+        try { const saved = Number(localStorage.getItem(key)); if (saved) apply(saved) } catch {}
+        grip.onpointerdown = (down) => {
+          const startY = down.clientY
+          const startH = el.getBoundingClientRect().height
+          grip.setPointerCapture(down.pointerId)
+          grip.classList.add('drag')
+          grip.onpointermove = (move) => apply(startH + move.clientY - startY)
+          grip.onpointerup = () => {
+            grip.classList.remove('drag')
+            grip.onpointermove = grip.onpointerup = null
+            try { localStorage.setItem(key, String(Math.round(el.getBoundingClientRect().height))) } catch {}
+          }
+        }
+      }
     </script>
   </body>
 </html>
