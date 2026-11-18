@@ -91,8 +91,20 @@
       .yt-form button:disabled { opacity: 0.5; cursor: default; }
       .yt-status { margin: -4px 12px 4px; font-size: 12px; color: var(--orca-muted-foreground); flex: none; }
       .yt-status.error { color: var(--orca-destructive-foreground); }
-      /* 최근 기록은 예전 높이의 2/5, 나머지는 검색 결과 */
-      #yt-history { flex: 2 1 0; min-height: 60px; }
+      /* 플레이어는 예전 최근 기록 자리(2/5), 나머지는 검색 결과 */
+      .yt-player { position: relative; flex: 2 1 0; min-height: 120px; margin: 4px 12px 0; border-radius: var(--radius); overflow: hidden; background: #000; }
+      .yt-player video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+      .yt-screen {
+        position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+        padding: 12px; text-align: center; font-size: 12px; color: var(--orca-muted-foreground); background: center / cover no-repeat var(--orca-card);
+      }
+      .yt-screen.thumb { color: #fff; box-shadow: inset 0 0 0 100vmax rgb(0 0 0 / 0.6); }
+      .yt-screen p { margin: 0; }
+      .yt-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+      .yt-actions button { height: 28px; padding: 0 12px; border-radius: var(--radius); font-size: 12px; font-weight: 600; color: #fff; background: rgb(255 255 255 / 0.18); }
+      .yt-actions button.primary { background: linear-gradient(160deg, #ff5c8a, #7c4dff); }
+      .yt-actions button:disabled { opacity: 0.5; cursor: default; }
+      .videos li.active .vtitle { color: var(--hl); }
       .videos { flex: 3 1 0; min-height: 0; overflow-y: auto; margin: 0; padding: 0 8px 12px; list-style: none; }
       .videos li { display: flex; gap: 8px; padding: 6px 4px; border-radius: var(--radius); cursor: pointer; }
       .videos li:hover { background: var(--orca-accent); }
@@ -175,12 +187,14 @@
         <input id="yt-query" placeholder="검색어 또는 유튜브 주소" aria-label="검색어 또는 유튜브 주소" />
         <button id="yt-go">검색</button>
       </form>
-      <p class="yt-status" id="yt-status">영상을 누르면 Orca 브라우저 탭에서 재생됩니다.</p>
-      <div class="list-head">
-        <h2>최근 기록</h2>
-        <button class="icon" id="yt-clear" title="기록 지우기"><svg><use href="#i-clear" /></svg></button>
+      <p class="yt-status" id="yt-status">검색어나 유튜브 주소를 입력하세요.</p>
+      <div class="yt-player" id="yt-player">
+        <video id="yt-video" controls playsinline hidden></video>
+        <div class="yt-screen" id="yt-screen">
+          <p id="yt-msg">검색 결과에서 영상을 누르면 여기에서 재생됩니다.</p>
+          <div class="yt-actions" id="yt-actions"></div>
+        </div>
       </div>
-      <ul class="playlist" id="yt-history"></ul>
       <div class="list-head">
         <h2 id="yt-count">검색 결과</h2>
       </div>
@@ -505,28 +519,13 @@
         if (localStorage.getItem('tab') === 'youtube') showTab('youtube')
       } catch {}
 
-      // 유튜브: 패널 안에는 유튜브를 넣을 수 없어(iframe 차단) worker가 Orca 브라우저 탭으로 연다.
-      let ytHistory = []
-      const saveHistory = () => orca.storage.set('ytHistory', ytHistory).catch(() => {})
-      function renderHistory() {
-        const list = $('yt-history')
-        if (!ytHistory.length) {
-          list.innerHTML = '<p class="hint">검색하거나 열었던 항목이 여기에 남습니다.</p>'
-          return
-        }
-        list.replaceChildren(
-          ...ytHistory.map((q, i) => {
-            const li = document.createElement('li')
-            li.dataset.i = i
-            li.innerHTML = '<span class="name"></span><button class="icon" title="기록에서 빼기"><svg><use href="#i-x" /></svg></button>'
-            li.querySelector('.name').textContent = li.title = q
-            return li
-          })
-        )
-      }
+      // 유튜브: 패널은 iframe·외부 미디어가 막혀 있어서(CSP) worker가 yt-dlp로 받은 파일을 조각으로 넘겨 blob으로 재생한다.
       let videos = []
-      const request = async (name, input) => {
-        const { output } = await orca.host.call('plugin.request', { name, input, timeoutMs: 30000 })
+      let playing = null // 지금 재생(준비) 중인 영상
+      let videoUrl = null
+      const video = $('yt-video')
+      const request = async (name, input, timeoutMs = 30000) => {
+        const { output } = await orca.host.call('plugin.request', { name, input, timeoutMs })
         if (output?.error) throw new Error(output.error)
         return output
       }
@@ -534,6 +533,32 @@
         $('yt-status').className = error ? 'yt-status error' : 'yt-status'
         $('yt-status').textContent = message
       }
+      // 플레이어 자리에 안내 화면을 띄운다. actions: [{ label, primary, run }]
+      function screen(message, actions = [], thumb = playing?.thumb) {
+        const el = $('yt-screen')
+        el.hidden = false
+        el.classList.toggle('thumb', Boolean(thumb))
+        el.style.backgroundImage = thumb ? `url("${thumb}")` : ''
+        $('yt-msg').textContent = message
+        $('yt-actions').replaceChildren(
+          ...actions.map(({ label, primary, run }) => {
+            const button = Object.assign(document.createElement('button'), { textContent: label, className: primary ? 'primary' : '' })
+            button.onclick = run
+            return button
+          })
+        )
+      }
+      const openInTab = (v) => ({
+        label: '브라우저 탭으로 열기',
+        run: async () => {
+          try {
+            await request('youtube.open', { query: `https://www.youtube.com/watch?v=${v.id}` })
+            screen('Orca 브라우저 탭에서 열었습니다.')
+          } catch (error) {
+            screen(`열지 못했습니다: ${error.message}`)
+          }
+        }
+      })
       function renderVideos() {
         $('yt-count').textContent = videos.length ? `검색 결과 (${videos.length})` : '검색 결과'
         $('yt-results').replaceChildren(
@@ -541,6 +566,7 @@
             const li = document.createElement('li')
             li.dataset.i = i
             li.title = v.title
+            li.className = v.id === playing?.id ? 'active' : ''
             li.innerHTML = '<div class="thumb"></div><div class="vinfo"><div class="vtitle"></div><div class="vmeta"></div><div class="vmeta"></div></div>'
             const thumb = li.querySelector('.thumb')
             if (v.thumb) thumb.appendChild(Object.assign(document.createElement('img'), { src: v.thumb, alt: '', loading: 'lazy' }))
@@ -552,22 +578,83 @@
             return li
           })
         )
-        $('yt-results').scrollTop = 0
       }
+      async function playVideo(v) {
+        playing = v
+        renderVideos()
+        video.pause()
+        video.hidden = true
+        screen('준비 중…')
+        try {
+          // 요청은 최대 2분이라, 다운로드가 길면 worker가 pending을 돌려주고 다시 묻는다.
+          let result
+          do {
+            result = await request('youtube.fetch', { id: v.id }, 110000)
+            if (playing !== v) return
+          } while (result.pending)
+          const { needsYtDlp, size } = result
+          if (needsYtDlp) return needYtDlp(v)
+          const parts = []
+          for (let offset = 0; offset < size; ) {
+            const { data } = await request('youtube.chunk', { id: v.id, offset })
+            if (playing !== v) return
+            const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0))
+            if (!bytes.length) break
+            parts.push(bytes)
+            offset += bytes.length
+            screen(`불러오는 중 ${Math.floor((offset / size) * 100)}%`)
+          }
+          if (videoUrl) URL.revokeObjectURL(videoUrl)
+          videoUrl = URL.createObjectURL(new Blob(parts, { type: 'video/mp4' }))
+          video.src = videoUrl
+          video.hidden = false
+          $('yt-screen').hidden = true
+          video.play().catch(() => {})
+        } catch (error) {
+          if (playing === v) screen(error.message, [openInTab(v)])
+        }
+      }
+      function needYtDlp(v) {
+        screen('패널에서 재생하려면 yt-dlp가 필요합니다.', [
+          {
+            label: 'yt-dlp 설치',
+            primary: true,
+            run: async (e) => {
+              e.target.disabled = true
+              screen('yt-dlp 받는 중… (약 18MB)')
+              try {
+                await request('youtube.install', {}, 120000)
+                playVideo(v)
+              } catch (error) {
+                screen(`설치하지 못했습니다: ${error.message}`, [openInTab(v)])
+              }
+            }
+          },
+          openInTab(v)
+        ])
+      }
+      orca.plugin?.on?.('youtube.progress', ({ id, percent }) => {
+        if (id === playing?.id && video.hidden) screen(`유튜브에서 받는 중 ${percent}%`)
+      })
+      // 음악과 유튜브가 겹쳐 나오지 않게 한쪽이 재생되면 다른 쪽을 멈춘다.
+      video.addEventListener('play', () => audio.pause())
+      audio.addEventListener('play', () => video.pause())
+
       async function searchYoutube(query) {
         if (!query) return
-        $('yt-query').value = query
         $('yt-go').disabled = true
         setStatus('검색 중…')
         try {
           const output = await request('youtube.search', { query })
-          ytHistory = [query, ...ytHistory.filter((q) => q !== query)].slice(0, 30)
-          saveHistory()
-          renderHistory()
           if (output.opened) return setStatus('Orca 브라우저 탭에서 열었습니다.')
+          if (output.videoId) {
+            setStatus('주소의 영상을 재생합니다.')
+            return playVideo({ id: output.videoId, title: query, thumb: '' })
+          }
           videos = output.videos ?? []
           renderVideos()
-          setStatus(videos.length ? '영상을 누르면 Orca 브라우저 탭에서 재생됩니다.' : '검색 결과가 없습니다.')
+          $('yt-results').scrollTop = 0
+          setStatus(videos.length ? '영상을 누르면 위에서 재생됩니다.' : '검색 결과가 없습니다.')
         } catch (error) {
           setStatus(`검색하지 못했습니다: ${error.message}`, true)
         } finally {
@@ -578,40 +665,10 @@
         e.preventDefault()
         searchYoutube($('yt-query').value.trim())
       }
-      $('yt-results').onclick = async (e) => {
+      $('yt-results').onclick = (e) => {
         const li = e.target.closest('li')
-        if (!li) return
-        const v = videos[li.dataset.i]
-        setStatus(`여는 중… ${v.title}`)
-        try {
-          await request('youtube.open', { query: `https://www.youtube.com/watch?v=${v.id}` })
-          setStatus(`재생 중: ${v.title}`)
-        } catch (error) {
-          setStatus(`열지 못했습니다: ${error.message}`, true)
-        }
+        if (li) playVideo(videos[li.dataset.i])
       }
-      $('yt-history').onclick = (e) => {
-        const li = e.target.closest('li')
-        if (!li) return
-        if (e.target.closest('button')) {
-          ytHistory.splice(Number(li.dataset.i), 1)
-          saveHistory()
-          renderHistory()
-        } else searchYoutube(ytHistory[li.dataset.i])
-      }
-      $('yt-clear').onclick = () => {
-        ytHistory = []
-        saveHistory()
-        renderHistory()
-      }
-      renderHistory()
-      orca.storage
-        .get('ytHistory')
-        .then((saved) => {
-          if (Array.isArray(saved)) ytHistory = saved.filter((q) => typeof q === 'string')
-          renderHistory()
-        })
-        .catch(() => {})
 
       if ('mediaSession' in navigator) {
         const actions = { play: toggle, pause: toggle, previoustrack: () => step(-1), nexttrack: () => step(1) }
