@@ -90,6 +90,23 @@ export function nameInfo(fileName) {
   return dash > 0 ? { artist: base.slice(0, dash).trim(), title: base.slice(dash + 3).trim() } : { artist: '', title: base }
 }
 
+const stem = (path) => path.replace(/\.[^./]+$/, '').toLowerCase()
+
+// 음악 파일에 맞는 .lrc를 찾는 함수를 돌려준다. 폴더로 넣었으면 폴더 경로까지 맞춘다.
+// 한쪽만 따로 고른 파일(경로 없음)이면 이름으로 맞추되, 같은 이름 .lrc가 여럿이면 고르지 않는다.
+export function lrcMatcher(lrcFiles) {
+  const pathOf = (f) => f.webkitRelativePath || f.name
+  const byPath = new Map(lrcFiles.map((f) => [stem(pathOf(f)), f]))
+  const byName = new Map()
+  for (const f of lrcFiles) byName.set(stem(f.name), byName.has(stem(f.name)) ? null : f)
+  return (audio) => {
+    const exact = byPath.get(stem(pathOf(audio)))
+    if (exact) return exact
+    const loose = byName.get(stem(audio.name))
+    return loose && (!audio.webkitRelativePath || !loose.webkitRelativePath) ? loose : undefined
+  }
+}
+
 // 다음 곡 인덱스. repeat: 'off' | 'all' | 'one'. 끝나면 -1.
 export function nextIndex(current, length, { repeat = 'off', shuffle = false, step = 1, auto = false, random = Math.random } = {}) {
   if (!length) return -1

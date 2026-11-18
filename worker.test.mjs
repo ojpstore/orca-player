@@ -1,7 +1,71 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { existsSync } from 'node:fs'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { cliResult, findYtDlp, isYoutubeUrl, parseSearch, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
+import { cliResult, findYtDlp, isYoutubeUrl, parseSearch, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
+
+// 손으로 끝낼 수 있는 가짜 yt-dlp. finish(내용)이면 파일을 쓰고 성공, fail()이면 실패한다.
+async function fakeFetcher() {
+  const dir = await mkdtemp(join(tmpdir(), 'orca-player-test-'))
+  const runs = []
+  const download = (ytdlp, id, file, onProgress, signal) =>
+    new Promise((resolve, reject) => {
+      runs.push({ id, file, signal, finish: async (body) => (await writeFile(file, body), resolve(file)), fail: () => reject(new Error('실패')) })
+    })
+  return { runs, videos: videoFetcher({ dir, find: () => 'yt-dlp.exe', download, post: () => {}, wait: 50 }) }
+}
+const A = 'AAAAAAAAAAA'
+const B = 'BBBBBBBBBBB'
+const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
+
+test('A→B: 이전 다운로드를 중단하고 늦게 끝나도 버린다', async () => {
+  const { runs, videos } = await fakeFetcher()
+  const a = videos.fetch(A)
+  await tick()
+  videos.fetch(B)
+  await tick()
+  assert.equal(runs[0].signal.aborted, true)
+  await runs[0].finish('a')
+  assert.deepEqual(await a, { pending: true })
+  assert.equal(existsSync(runs[0].file), false)
+  await runs[1].finish('bb')
+  assert.deepEqual(await videos.fetch(B), { size: 2 })
+  assert.deepEqual(await videos.chunk(A), { error: '받아 둔 영상이 바뀌었습니다.' })
+})
+
+test('A→B→A: 첫 A가 먼저 끝나도 두 번째 A가 끝나기 전엔 준비되지 않는다', async () => {
+  const { runs, videos } = await fakeFetcher()
+  videos.fetch(A)
+  await tick()
+  videos.fetch(B)
+  await tick()
+  videos.fetch(A)
+  await tick()
+  assert.equal(runs.length, 3)
+  assert.notEqual(runs[0].file, runs[2].file) // 같은 파일에 겹쳐 쓰지 않는다.
+  await runs[0].finish('old')
+  assert.deepEqual(await videos.fetch(A), { pending: true })
+  await runs[2].finish('new!')
+  assert.deepEqual(await videos.fetch(A), { size: 4 }) // 패널처럼 다시 묻는다.
+  assert.equal(await readFile(runs[2].file, 'utf8'), 'new!')
+  assert.equal(existsSync(runs[0].file), false)
+  assert.equal(Buffer.from((await videos.chunk(A)).data, 'base64').toString(), 'new!')
+})
+
+test('다운로드 실패는 오류로 알리고 다시 누르면 새로 받는다', async () => {
+  const { runs, videos } = await fakeFetcher()
+  const a = videos.fetch(A)
+  await tick()
+  runs[0].fail()
+  assert.deepEqual(await a, { error: '실패' })
+  videos.fetch(A)
+  await tick()
+  assert.equal(runs.length, 2)
+  await runs[1].finish('ok')
+  assert.deepEqual(await videos.fetch(A), { size: 2 })
+})
 
 test('유튜브 주소는 그대로, 나머지는 검색으로', () => {
   assert.equal(youtubeUrl('https://www.youtube.com/watch?v=abc'), 'https://www.youtube.com/watch?v=abc')

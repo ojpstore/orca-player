@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { formatTime, lyricIndex, nameInfo, nextIndex, parseId3, parseLrc } from './player.js'
+import { formatTime, lrcMatcher, lyricIndex, nameInfo, nextIndex, parseId3, parseLrc } from './player.js'
 
 test('LRC: 같은 시각 줄을 묶고 offset과 여러 시각 태그를 처리한다', () => {
   const lrc = '[ti:노래]\n[offset:500]\n[00:01.00]첫 줄\n[00:01.00]first\n[00:03.50][00:10.00]후렴\n[00:05:20]콜론 표기'
@@ -36,6 +36,23 @@ test('ID3v2.3: CP949 제목, UTF-16 아티스트, USLT, APIC를 읽는다', () =
   assert.equal(tags.picture.mime, 'image/png')
   assert.deepEqual([...tags.picture.data], [1, 2, 3])
   assert.deepEqual(parseId3(new Uint8Array([0xff, 0xfb, 0, 0]).buffer), {})
+})
+
+test('LRC 짝: 폴더가 다른 같은 이름 곡은 각자 폴더의 가사를 받는다', () => {
+  const f = (name, dir = '') => ({ name, webkitRelativePath: dir && `${dir}/${name}` })
+  const lrcA = f('01.lrc', 'top/albumA')
+  const lrcB = f('01.lrc', 'top/albumB')
+  const folder = lrcMatcher([lrcA, lrcB])
+  assert.equal(folder(f('01.mp3', 'top/albumA')), lrcA)
+  assert.equal(folder(f('01.mp3', 'top/albumB')), lrcB)
+  assert.equal(folder(f('01.mp3', 'top/albumC')), undefined)
+  assert.equal(folder(f('01.mp3')), undefined) // 같은 이름이 여럿이면 고르지 않는다.
+  // 파일로 고른 경우와, 폴더로 넣은 곡에 .lrc만 따로 넣는 경우
+  const single = f('아이유 - 밤편지.LRC')
+  assert.equal(lrcMatcher([single])(f('아이유 - 밤편지.mp3')), single)
+  assert.equal(lrcMatcher([single])(f('아이유 - 밤편지.mp3', 'top/x')), single)
+  assert.equal(lrcMatcher([lrcA])(f('01.mp3')), lrcA)
+  assert.equal(lrcMatcher([])(f('01.mp3')), undefined)
 })
 
 test('파일 이름, 다음 곡, 시간 표시', () => {

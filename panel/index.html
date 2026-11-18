@@ -206,7 +206,7 @@
     <audio id="audio" preload="metadata"></audio>
 
     <script type="module">
-      import { formatTime, lyricIndex, nameInfo, nextIndex, parseId3, parseLrc } from './player.js'
+      import { formatTime, lrcMatcher, lyricIndex, nameInfo, nextIndex, parseId3, parseLrc } from './player.js'
 
       const $ = (id) => document.getElementById(id)
       const audio = $('audio')
@@ -222,12 +222,12 @@
       const prefs = { volume: 0.8, repeat: 'all', shuffle: false }
 
       const icon = (el, name) => el.querySelector('use').setAttribute('href', `#i-${name}`)
-      const baseName = (name) => name.replace(/\.[^.]+$/, '').toLowerCase()
       const savePrefs = () => orca.storage.set('prefs', prefs).catch(() => {})
 
-      async function readTags(track) {
-        if (track.tagged) return
-        track.tagged = true
+      // 읽는 중인 곡을 골라도 같은 Promise를 기다려 다 읽은 뒤에 화면을 그린다.
+      const readTags = (track) => (track.tagged ??= loadTags(track))
+
+      async function loadTags(track) {
         try {
           // ID3v2는 파일 앞에 있어서 앞부분만 읽는다. 앨범아트가 크면 잘릴 수 있어 넉넉히 잡는다.
           const head = await track.file.slice(0, 4 * 1024 * 1024).arrayBuffer()
@@ -237,31 +237,37 @@
           if (tags.lyrics && !track.lrcText) track.lrcText = tags.lyrics
           if (tags.picture) track.cover = URL.createObjectURL(new Blob([tags.picture.data], { type: tags.picture.mime }))
         } catch {}
-        if (track.lrcFile && !track.lrcLoaded) {
-          track.lrcLoaded = true
+        await loadLrc(track)
+      }
+
+      async function loadLrc(track) {
+        if (!track.lrcFile) return
+        try {
           // 알송 등에서 받은 .lrc는 CP949인 경우가 많다. UTF-8로 깨지면 euc-kr로 다시 읽는다.
           const bytes = await track.lrcFile.arrayBuffer()
           const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
           track.lrcText = utf8.includes('�') ? new TextDecoder('euc-kr').decode(bytes) : utf8
-        }
+        } catch {}
       }
 
       function addFiles(fileList) {
         const files = [...fileList]
-        const lrcs = new Map(files.filter((f) => /\.lrc$/i.test(f.name)).map((f) => [baseName(f.name), f]))
+        const lrcFor = lrcMatcher(files.filter((f) => /\.lrc$/i.test(f.name)))
         const fresh = files
           .filter((f) => AUDIO_EXT.test(f.name))
           .sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name, 'ko'))
-          .map((file) => ({ file, url: URL.createObjectURL(file), ...nameInfo(file.name), lrcFile: lrcs.get(baseName(file.name)) }))
-        // 이미 있는 곡에 맞는 .lrc만 따로 넣은 경우
+          .map((file) => ({ file, url: URL.createObjectURL(file), ...nameInfo(file.name), lrcFile: lrcFor(file) }))
+        // 이미 있는 곡에 맞는 .lrc만 따로 넣은 경우: 태그를 읽었거나 읽는 중이면 그 뒤에 가사만 이어 읽는다.
         for (const t of tracks) {
-          const lrc = lrcs.get(baseName(t.file.name))
-          if (lrc && !t.lrcFile) Object.assign(t, { lrcFile: lrc, lrcLoaded: false, tagged: false })
+          const lrc = lrcFor(t.file)
+          if (!lrc || t.lrcFile) continue
+          t.lrcFile = lrc
+          if (t.tagged) t.tagged = t.tagged.then(() => loadLrc(t))
         }
         tracks.push(...fresh)
         renderList()
         if (current === -1 && fresh.length) play(tracks.length - fresh.length)
-        else if (current >= 0 && lrcs.has(baseName(tracks[current].file.name))) showTrack()
+        else if (current >= 0 && lrcFor(tracks[current].file)) showTrack()
         fresh.forEach((t) => readTags(t).then(renderList))
       }
 
@@ -671,7 +677,8 @@
       }
 
       if ('mediaSession' in navigator) {
-        const actions = { play: toggle, pause: toggle, previoustrack: () => step(-1), nexttrack: () => step(1) }
+        // 토글이 아니라 명령대로: 재생 중 play, 정지 중 pause가 와도 상태를 뒤집지 않는다.
+        const actions = { play: () => (current < 0 ? toggle() : audio.play().catch(() => {})), pause: () => audio.pause(), previoustrack: () => step(-1), nexttrack: () => step(1) }
         for (const [name, fn] of Object.entries(actions)) {
           try {
             navigator.mediaSession.setActionHandler(name, fn)

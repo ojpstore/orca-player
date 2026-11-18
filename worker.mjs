@@ -125,8 +125,8 @@ export function ytDlpError(stderr) {
   return last.replace(/^ERROR:\s*/, '') || 'yt-dlp가 실패했습니다.'
 }
 
-function downloadVideo(ytdlp, id, onProgress) {
-  const file = join(VIDEO_DIR, `${id}.mp4`)
+// signal로 중단하면 spawn이 yt-dlp를 죽이고 AbortError로 끝난다.
+function downloadVideo(ytdlp, id, file, onProgress, signal) {
   const args = [
     // 회사 SSL 검사 인증서처럼 Windows에만 등록된 루트 인증서도 믿도록 OS 인증서 저장소를 쓴다.
     '--compat-options', 'no-certifi',
@@ -137,7 +137,7 @@ function downloadVideo(ytdlp, id, onProgress) {
     `https://www.youtube.com/watch?v=${id}`
   ]
   return new Promise((resolve, reject) => {
-    const child = spawn(ytdlp, args, { windowsHide: true })
+    const child = spawn(ytdlp, args, { windowsHide: true, signal })
     let stderr = ''
     child.stdout.on('data', (data) => {
       const match = String(data).match(/\[download\]\s+([\d.]+)%/g)?.pop()
@@ -147,6 +147,72 @@ function downloadVideo(ytdlp, id, onProgress) {
     child.on('error', reject)
     child.on('close', (code) => (code === 0 ? resolve(file) : reject(new Error(ytDlpError(stderr)))))
   })
+}
+
+// 한 번에 한 영상만 받아 두고, 새 영상을 받을 때 이전 파일을 지운다.
+// 패널 요청은 최대 2분이라 다운로드는 뒤에서 돌리고, 끝나지 않았으면 pending을 돌려 패널이 다시 묻게 한다.
+// 새 영상을 고르면 이전 다운로드는 중단하고, 작업마다 다른 파일에 받아 A→B→A에서도 같은 파일에 겹쳐 쓰지 않는다.
+export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
+  let current = null // { id, file, size }
+  let job = null // { id, abort, promise } — 완료 판정은 id가 아니라 이 객체로 한다.
+  let seq = 0
+  const discard = (file) => Promise.all([file, `${file}.part`].map((f) => rm(f, { force: true }).catch(() => {})))
+
+  async function fetchVideo(id) {
+    if (!/^[\w-]{11}$/.test(id ?? '')) return { error: '잘못된 영상 id입니다.' }
+    if (current?.id === id) return { size: current.size }
+    if (job?.id !== id) {
+      const ytdlp = find()
+      if (!ytdlp) return { needsYtDlp: true }
+      job?.abort.abort()
+      const me = { id, abort: new AbortController() }
+      const file = join(dir, `${id}-${++seq}.mp4`)
+      const old = current
+      current = null
+      let last = -1
+      me.promise = (async () => {
+        if (old) await discard(old.file)
+        await mkdir(dir, { recursive: true })
+        try {
+          await download(ytdlp, id, file, (percent) => {
+            if (Math.floor(percent) === last) return
+            last = Math.floor(percent)
+            post('youtube.progress', { id, percent: last })
+          }, me.abort.signal)
+        } catch (error) {
+          await discard(file)
+          throw error
+        }
+        // 그사이 다른 영상(같은 id의 새 작업 포함)을 눌렀으면 이 파일은 버린다.
+        if (job !== me) return void (await discard(file))
+        current = { id, file, size: (await stat(file)).size }
+      })()
+      job = me
+      me.promise.catch(() => {}).finally(() => job === me && (job = null))
+    }
+    const me = job
+    try {
+      const done = await Promise.race([me.promise.then(() => true), new Promise((resolve) => setTimeout(resolve, wait, false))])
+      // 밀려난 작업을 기다리던 요청은 pending으로 돌려 최신 작업을 다시 기다리게 한다.
+      return done && current?.id === id ? { size: current.size } : { pending: true }
+    } catch (error) {
+      return me.abort.signal.aborted ? { pending: true } : { error: error.message }
+    }
+  }
+
+  async function chunk(id, offset = 0) {
+    if (current?.id !== id) return { error: '받아 둔 영상이 바뀌었습니다.' }
+    const handle = await openFile(current.file, 'r')
+    try {
+      const buffer = Buffer.alloc(Math.min(CHUNK_BYTES, current.size - offset))
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
+      return { data: buffer.subarray(0, bytesRead).toString('base64') }
+    } finally {
+      await handle.close()
+    }
+  }
+
+  return { fetch: fetchVideo, chunk }
 }
 
 // worker는 Orca.exe로 실행되므로 그 옆의 번들 CLI를 먼저 쓴다.
@@ -235,50 +301,7 @@ export default function activate(plugin) {
     }
   })
 
-  // 한 번에 한 영상만 받아 두고, 새 영상을 받을 때 이전 파일을 지운다.
-  // 패널 요청은 최대 2분이라 다운로드는 뒤에서 돌리고, 끝나지 않았으면 pending을 돌려 패널이 다시 묻게 한다.
-  let current = null // { id, file, size }
-  let job = null // { id, promise }
-  plugin.panels.handle('youtube.fetch', async ({ id } = {}) => {
-    if (!/^[\w-]{11}$/.test(id ?? '')) return { error: '잘못된 영상 id입니다.' }
-    if (current?.id === id) return { size: current.size }
-    if (job?.id !== id) {
-      const ytdlp = findYtDlp()
-      if (!ytdlp) return { needsYtDlp: true }
-      let last = -1
-      const promise = (async () => {
-        if (current) await rm(current.file, { force: true })
-        current = null
-        await mkdir(VIDEO_DIR, { recursive: true })
-        const file = await downloadVideo(ytdlp, id, (percent) => {
-          if (Math.floor(percent) === last) return
-          last = Math.floor(percent)
-          plugin.panels.post('youtube.progress', { id, percent: last })
-        })
-        // 그사이 다른 영상을 눌렀으면 이 파일은 버린다.
-        if (job?.id !== id) return void (await rm(file, { force: true }))
-        current = { id, file, size: (await stat(file)).size }
-      })()
-      job = { id, promise }
-      promise.catch(() => {}).finally(() => job?.promise === promise && (job = null))
-    }
-    const { promise } = job
-    try {
-      const done = await Promise.race([promise.then(() => true), new Promise((resolve) => setTimeout(resolve, 90000, false))])
-      return done ? { size: current.size } : { pending: true }
-    } catch (error) {
-      return { error: error.message }
-    }
-  })
-  plugin.panels.handle('youtube.chunk', async ({ id, offset = 0 } = {}) => {
-    if (current?.id !== id) return { error: '받아 둔 영상이 바뀌었습니다.' }
-    const handle = await openFile(current.file, 'r')
-    try {
-      const buffer = Buffer.alloc(Math.min(CHUNK_BYTES, current.size - offset))
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
-      return { data: buffer.subarray(0, bytesRead).toString('base64') }
-    } finally {
-      await handle.close()
-    }
-  })
+  const videos = videoFetcher({ dir: VIDEO_DIR, find: () => findYtDlp(), download: downloadVideo, post: (name, data) => plugin.panels.post(name, data) })
+  plugin.panels.handle('youtube.fetch', ({ id } = {}) => videos.fetch(id))
+  plugin.panels.handle('youtube.chunk', ({ id, offset = 0 } = {}) => videos.chunk(id, offset))
 }
