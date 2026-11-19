@@ -537,7 +537,11 @@
         $('cover-box').innerHTML = '<svg><use href="#i-music" /></svg>'
         lyrics = []
         renderLyrics('')
+        // src만 지우면 currentTime이 남고, pause()가 큐에 넣은 timeupdate가 나중에 0:17 같은 값을 다시 그린다.
+        // load()로 미디어 요소를 비워 위치를 0으로 되돌린다.
+        audio.load()
         $('seek').max = 0
+        $('seek').value = 0
         $('pos').textContent = $('dur').textContent = '0:00'
       }
 
