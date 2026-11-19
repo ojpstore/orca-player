@@ -130,7 +130,10 @@
       .yt-pill:hover { background: var(--orca-accent); color: var(--orca-accent-foreground); }
       .yt-pill[aria-pressed='true'] { color: var(--hl); border-color: var(--hl); background: rgb(255 92 138 / 0.1); }
       .videos li.active .vtitle { color: var(--hl); }
-      .videos { flex: 3 1 0; min-height: 0; overflow-y: auto; margin: 0; padding: 0 8px 12px; list-style: none; }
+      .videos-wrap { flex: 3 1 0; min-height: 0; position: relative; display: flex; flex-direction: column; }
+      .list-loading { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; font-size: 13px; color: #fff; background: rgb(0 0 0 / 0.88); backdrop-filter: blur(2px); font-weight: 600; }
+      .list-loading[hidden] { display: none; }
+      .videos { flex: 1 1 0; min-height: 0; overflow-y: auto; margin: 0; padding: 0 8px 12px; list-style: none; }
       .videos li { display: flex; gap: 8px; padding: 6px 4px; border-radius: var(--radius); cursor: pointer; align-items: flex-start; }
       .videos li:hover { background: var(--orca-accent); }
       .videos li .fav { width: 24px; height: 24px; flex: none; font-size: 14px; line-height: 24px; text-align: center; color: var(--orca-muted-foreground); border-radius: var(--radius); opacity: 0.45; }
@@ -249,7 +252,10 @@
         <button class="yt-pill" id="yt-rate" title="재생 속도 변경 (1.0x / 1.25x / 1.5x / 2.0x)">1.0x</button>
         <button class="icon" id="yt-reset" title="초기화 (재생 중지, 받는 중인 영상 취소, 기본 목록으로 되돌리기)"><svg><use href="#i-reset" /></svg></button>
       </div>
-      <ul class="videos" id="yt-results"></ul>
+      <div class="videos-wrap">
+        <ul class="videos" id="yt-results"></ul>
+        <div class="list-loading" id="yt-list-loading" hidden><div class="yt-spin"></div><span id="yt-list-loading-msg"></span></div>
+      </div>
     </div>
 
     <dialog id="ask">
@@ -801,6 +807,11 @@
         $('yt-status').className = error ? 'yt-status error' : 'yt-status'
         $('yt-status').textContent = message
       }
+      // 목록 위에 로딩 표시를 띄운다. message가 없으면 숨긴다.
+      function listLoading(message) {
+        $('yt-list-loading').hidden = !message
+        $('yt-list-loading-msg').textContent = message ?? ''
+      }
       // 플레이어 자리에 안내 화면을 띄운다. actions: [{ label, primary, run }]
       function screen(message, actions = [], thumb = playing?.thumb, busy = false) {
         const el = $('yt-screen')
@@ -1094,6 +1105,7 @@
 
       function showFavorites() {
         ytLoaded = true
+        listLoading()
         searchSeq++
         ytMode = 'favorites'
         listTitle = '즐겨찾기'
@@ -1114,10 +1126,12 @@
         ytMode = 'topic'
         applyYtPrefs()
         const seq = ++searchSeq
-        setStatus(`${label}를 불러오는 중…`)
+        setStatus('')
+        listLoading(`${label}를 불러오는 중…`)
         try {
           const output = await request('youtube.popular', { topic: key })
           if (seq !== searchSeq) return
+          listLoading()
           listTitle = label
           videos = output.videos ?? []
           renderVideos()
@@ -1125,6 +1139,7 @@
           setStatus(videos.length ? `${label}입니다. 영상을 누르면 위에서 재생됩니다.` : '인기 영상을 찾지 못했습니다.')
         } catch (error) {
           if (seq !== searchSeq) return
+          listLoading()
           ytLoaded = false
           setStatus(`인기 영상을 불러오지 못했습니다: ${error.message}`, true)
         }
@@ -1135,6 +1150,7 @@
         ytMode = 'search'
         applyYtPrefs()
         const seq = ++searchSeq
+        listLoading()
         $('yt-go').disabled = true
         setStatus('검색 중…')
         try {

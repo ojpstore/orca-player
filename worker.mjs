@@ -92,11 +92,11 @@ const BROWSER_HEADERS = {
   'accept-language': 'ko-KR,ko;q=0.9'
 }
 
-// 기본 검색 결과 프리셋: 주제별 오늘의 인기 영상 30개.
+// 기본 검색 결과 프리셋: 주제별 오늘 올라온 영상 최신순 100개.
 export const POPULAR_AI_QUERY = 'AI 에이전트 OR 클로드 OR 제미나이 OR GPT OR LLM'
-export const POPULAR_TODAY_SP = 'CAMSBAgCEAE%3D'
+export const POPULAR_TODAY_SP = 'CAISBAgCEAE%3D'
 export const POPULAR_MUSIC_PLAYLIST = 'PL4fGSI1pDJn6Q7vxp4-2ETPMtSuAPuZ8Y' // YouTube 공식 '일간 인기 뮤직비디오 - 한국'
-export const POPULAR_LIMIT = 30
+export const POPULAR_LIMIT = 100
 export const POPULAR_PRESETS = {
   ai: { query: POPULAR_AI_QUERY, sp: POPULAR_TODAY_SP },
   music: { playlist: POPULAR_MUSIC_PLAYLIST },
@@ -159,10 +159,10 @@ export async function relatedYoutube(id, { limit = 10, fetchImpl = fetch } = {})
   return videos
 }
 
-// 패널은 외부 이미지를 못 불러서 썸네일을 data URL로 넘긴다. 실패한 썸네일은 비워 둔다.
+// 패널은 외부 이미지를 못 불러서 썸네일을 data URL로 넘긴다(100개가 응답 한도 1MiB 안에 들도록 작은 120x90). 실패한 썸네일은 비워 둔다.
 async function thumbnail(id, fetchImpl = fetch) {
   try {
-    const res = await fetchImpl(`https://i.ytimg.com/vi/${id}/mqdefault.jpg`, { signal: AbortSignal.timeout(8000) })
+    const res = await fetchImpl(`https://i.ytimg.com/vi/${id}/default.jpg`, { signal: AbortSignal.timeout(8000) })
     if (!res.ok) return ''
     return `data:image/jpeg;base64,${Buffer.from(await res.arrayBuffer()).toString('base64')}`
   } catch {
@@ -189,7 +189,7 @@ export async function searchYoutube(query, { sp = '', limit = 0, fetchImpl = fet
   append(page.videos)
   // 첫 검색 페이지는 보통 20개만 오므로, limit(예: 30개)을 채우기 위해 다음 페이지를 이어서 받는다.
   let token = page.continuation
-  for (let i = 0; limit > 0 && videos.length < limit && token && page.apiKey && i < 3; i++) {
+  for (let i = 0; limit > 0 && videos.length < limit && token && page.apiKey && i < 8; i++) {
     try {
       const more = await fetchImpl(`https://www.youtube.com/youtubei/v1/search?key=${page.apiKey}`, {
         method: 'POST',

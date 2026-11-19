@@ -178,7 +178,7 @@ test('초기화하면 받던 다운로드를 멈추고 받아 둔 영상 파일�
   assert.equal(runs[1].signal.aborted, true) // 받는 중이던 것은 중단한다.
 })
 
-test('오늘의 AI 인기 영상은 continuation으로 중복 없이 30개를 채우고 조회수 형식을 맞춘다', async () => {
+test('오늘의 AI 인기 영상은 continuation으로 중복 없이 30개로 제한해  채우고 조회수 형식을 맞춘다', async () => {
   const item = (n, views) => ({
     videoRenderer: {
       videoId: `vid_${String(n).padStart(7, '0')}`,
@@ -213,7 +213,7 @@ test('오늘의 AI 인기 영상은 continuation으로 중복 없이 30개를 �
     return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2]).buffer }
   }
 
-  const list = await popularYoutube({ fetchImpl: fakeFetch })
+  const list = await popularYoutube({ limit: 30, fetchImpl: fakeFetch })
   assert.equal(list.length, 30)
   assert.equal(new Set(list.map((v) => v.id)).size, 30)
   assert.equal(list[0].views, '20만')
