@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pickFolder, listMusic, loadMusicFolder, readMusic, cliResult, findYtDlp, isYoutubeUrl, parsePlaylist, parseSearch, popularYoutube, POPULAR_AI_QUERY, POPULAR_MUSIC_PLAYLIST, POPULAR_TODAY_SP, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
+import { pickFolder, listMusic, loadMusicFolder, readMusic, cliResult, findYtDlp, isYoutubeUrl, parsePlaylist, parseSearch, playbackCoordinator, popularYoutube, POPULAR_AI_QUERY, POPULAR_MUSIC_PLAYLIST, POPULAR_TODAY_SP, relatedYoutube, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
 
 // 손으로 끝낼 수 있는 가짜 yt-dlp. finish(내용)이면 파일을 쓰고 성공, fail()이면 실패한다.
 async function fakeFetcher() {
@@ -322,4 +322,91 @@ test('인기 음악 프리셋은 공식 차트 재생목록(lockupViewModel)을 
   assert.ok(calls[0].includes(`list=${POPULAR_MUSIC_PLAYLIST}`))
   assert.equal(list.length, 1)
   assert.equal(list[0].thumb, 'data:image/jpeg;base64,CQ==')
+})
+
+test('관련 영상(다음 자동 재생)은 자기 자신 id를 제외하고 추천 영상을 뽑는다', async () => {
+  const watchData = {
+    contents: [
+      { lockupViewModel: { contentId: A, metadata: { lockupMetadataViewModel: { title: { content: '현재 영상' } } } } },
+      { lockupViewModel: { contentId: B, metadata: { lockupMetadataViewModel: { title: { content: '다음 추천' } } } } },
+      { compactVideoRenderer: { videoId: 'CCCCCCCCCCC', title: { simpleText: '추천 2' }, longBylineText: { runs: [{ text: '채널' }] }, shortViewCountText: { simpleText: '조회수 5만회' } } }
+    ]
+  }
+  const html = `<script>var ytInitialData = ${JSON.stringify(watchData)};</script>`
+  const fakeFetch = async (url) => {
+    if (url.includes('/watch?')) return { ok: true, text: async () => html }
+    return { ok: true, arrayBuffer: async () => new Uint8Array([3]).buffer }
+  }
+  const list = await relatedYoutube(A, { limit: 2, fetchImpl: fakeFetch })
+  assert.deepEqual(list.map((v) => v.id), [B, 'CCCCCCCCCCC'])
+  assert.equal(list[1].views, '5만')
+  assert.equal(list[0].thumb, 'data:image/jpeg;base64,Aw==')
+  await assert.rejects(() => relatedYoutube('bad', { fetchImpl: fakeFetch }))
+})
+
+test('패널이 닫히거나 하트비트가 끊기면 백그라운드 재생을 이어받고, 다시 열리면 현재 위치를 돌려준다', async () => {
+  let clock = 1000
+  const played = []
+  let endedCb = null
+  const fakePlayer = {
+    warmup() {},
+    async play(file, opts) { played.push({ file, ...opts }) },
+    async stop() { return 42.5 },
+    onEnded(fn) { endedCb = fn },
+    dispose() {}
+  }
+  const bg = playbackCoordinator({
+    player: fakePlayer,
+    resolveFile: (s) => (s.kind === 'music' ? `/music/${s.trackId}.mp3` : null),
+    nextItem: async (ended) => ({ ...ended, trackId: ended.trackId + 1, path: 'next.mp3' }),
+    now: () => clock,
+    staleMs: 25
+  })
+
+  bg.updateState({ kind: 'music', trackId: 1, path: 'first.mp3', time: 10, volume: 0.7, rate: 1, playing: true })
+  clock = 3000 // 하트비트가 끊긴 뒤 2초 경과 시뮬레이션
+  await new Promise((r) => setTimeout(r, 40))
+
+  assert.equal(played.length, 1)
+  assert.equal(played[0].file, '/music/1.mp3')
+  assert.equal(played[0].time, 12) // 10초 + 2초 경과 보정
+  assert.equal(played[0].volume, 0.7)
+
+  // 백그라운드 재생 중 곡이 끝나면 다음 곡으로 이어 재생한다.
+  await endedCb()
+  assert.equal(played.length, 2)
+  assert.equal(played[1].file, '/music/2.mp3')
+  assert.equal(played[1].time, 0)
+
+  // 다시 패널로 돌아오면 백그라운드 재생을 멈추고 현재 위치와 바뀐 곡 정보를 넘긴다.
+  const resumed = await bg.takeover()
+  assert.equal(resumed.active, true)
+  assert.equal(resumed.state.trackId, 2)
+  assert.equal(resumed.state.time, 42.5)
+  assert.deepEqual(await bg.takeover(), { active: false })
+
+  // pagehide 즉시 인계(handoff)도 바로 백그라운드 재생을 시작한다.
+  bg.handoff({ kind: 'music', trackId: 3, path: 'third.mp3', time: 5, volume: 0.5, rate: 1, playing: true })
+  await tick()
+  assert.equal(played.length, 3)
+  assert.equal(played[2].file, '/music/3.mp3')
+  assert.equal(played[2].time, 5)
+  await bg.stop()
+})
+
+test('하트비트에 큐가 없으면 이전 큐를 유지하고, stop 뒤에는 시작 중이던 재생이 되살아나지 않는다', async () => {
+  const played = []
+  let endedCb
+  const bg = playbackCoordinator({
+    player: { play: async (f) => played.push(f), stop: async () => 0, onEnded: (fn) => (endedCb = fn), warmup() {}, dispose() {} },
+    resolveFile: (s) => `/m/${s.trackId}.mp3`,
+    nextItem: async (e) => e.queue[1] && { ...e, trackId: e.queue[1].id },
+    staleMs: 10
+  })
+  bg.updateState({ kind: 'music', trackId: 1, time: 0, rate: 1, playing: true, queue: [{ id: 1 }, { id: 2 }] })
+  bg.updateState({ kind: 'music', trackId: 1, time: 1, rate: 1, playing: true })
+  await new Promise((r) => setTimeout(r, 30))
+  await endedCb()
+  assert.deepEqual(played, ['/m/1.mp3', '/m/2.mp3'])
+  await bg.stop()
 })

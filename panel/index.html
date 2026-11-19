@@ -244,6 +244,7 @@
       <div class="grip" data-target="yt-player" data-min="90" title="끌어서 플레이어 높이 조절"></div>
       <div class="list-head">
         <h2 id="yt-count">검색 결과</h2>
+        <button class="yt-pill" id="yt-autoplay" aria-pressed="false" title="영상 끝나면 다음 영상 자동 재생 (1건이거나 마지막이면 추천 영상 이어 재생)">연속</button>
         <button class="yt-pill" id="yt-audio" aria-pressed="false" title="오디오 전용 모드 (더 빠르고 가볍게 듣기)">오디오만</button>
         <button class="yt-pill" id="yt-rate" title="재생 속도 변경 (1.0x / 1.25x / 1.5x / 2.0x)">1.0x</button>
         <button class="icon" id="yt-reset" title="초기화 (재생 중지, 받는 중인 영상 취소, 기본 목록으로 되돌리기)"><svg><use href="#i-reset" /></svg></button>
@@ -403,7 +404,7 @@
         fresh.filter((t) => !t.file.remote).forEach((t) => readTags(t).then(renderList))
       }
 
-      async function play(index) {
+      async function play(index, { startTime = 0 } = {}) {
         if (index < 0 || index >= tracks.length) return
         const prev = tracks[current]
         current = index
@@ -440,6 +441,11 @@
           }
         }
         audio.src = t.url
+        if (startTime > 0) {
+          audio.addEventListener('loadedmetadata', () => {
+            if (tracks[current] === t && Number.isFinite(audio.duration)) audio.currentTime = Math.min(startTime, Math.max(0, audio.duration - 0.2))
+          }, { once: true })
+        }
         prefetchNext()
         audio.play().catch(() => {})
         await showTrack()
@@ -580,6 +586,7 @@
 
       function applyPrefs() {
         audio.volume = prefs.volume
+        video.volume = prefs.volume
         $('volume').value = prefs.volume
         $('shuffle').setAttribute('aria-pressed', prefs.shuffle)
         const rep = $('repeat')
@@ -626,6 +633,7 @@
         audio.removeAttribute('src')
         resetNow()
         renderList()
+        request('playback.stop', {}).catch(() => {})
       }
       $('clear').onclick = async () => {
         if (tracks.length && (await ask(`재생 목록의 곡 ${tracks.length}개를 모두 비울까요?`))) clearTracks()
@@ -653,6 +661,7 @@
       $('volume').oninput = (e) => {
         prefs.volume = Number(e.target.value)
         audio.volume = prefs.volume
+        video.volume = prefs.volume
         audio.muted = false
       }
       $('volume').onchange = savePrefs
@@ -681,8 +690,12 @@
         icon($('play'), audio.paused ? 'play' : 'pause')
         $('play').title = audio.paused ? '재생' : '일시정지'
         renderList()
+        if (!panelHidden || !audio.paused) syncPlaybackState(true)
       }
-      audio.onvolumechange = () => icon($('mute'), audio.muted || audio.volume === 0 ? 'mute' : 'vol')
+      audio.onvolumechange = () => {
+        icon($('mute'), audio.muted || audio.volume === 0 ? 'mute' : 'vol')
+        syncPlaybackState(true)
+      }
       audio.onloadedmetadata = () => {
         $('seek').max = audio.duration || 0
         $('dur').textContent = formatTime(audio.duration)
@@ -691,6 +704,7 @@
         if (document.activeElement !== $('seek')) $('seek').value = audio.currentTime
         $('pos').textContent = formatTime(audio.currentTime)
         syncLyrics()
+        if (!audio.paused) syncPlaybackState()
       }
       audio.onended = () => {
         const next = nextIndex(current, tracks.length, { ...prefs, auto: true })
@@ -745,8 +759,9 @@
       // 유튜브: 패널은 iframe·외부 미디어가 막혀 있어서(CSP) worker가 yt-dlp로 받은 파일을 조각으로 넘겨 blob으로 재생한다.
       const YT_TOPICS = { ai: '오늘의 AI 기술 트렌드', music: '오늘의 인기 음악', dev: '오늘의 개발·테크', news: '오늘의 뉴스' }
       const YT_RATES = [1, 1.25, 1.5, 2]
-      const ytPrefs = { topic: 'ai', audioOnly: false, rate: 1 }
+      const ytPrefs = { topic: 'ai', audioOnly: false, rate: 1, autoplay: false }
       let ytFavorites = []
+      const playedIds = new Set()
       let ytMode = 'topic' // 'topic' | 'favorites' | 'search'
       let videos = []
       let listTitle = '검색 결과'
@@ -759,6 +774,7 @@
       const saveYtFavorites = () => orca.storage.set('ytFavorites', ytFavorites).catch(() => {})
       const isFavorite = (id) => ytFavorites.some((f) => f.id === id)
       function applyYtPrefs() {
+        $('yt-autoplay').setAttribute('aria-pressed', String(ytPrefs.autoplay))
         $('yt-audio').setAttribute('aria-pressed', String(ytPrefs.audioOnly))
         $('yt-rate').textContent = `${ytPrefs.rate}x`
         $('yt-rate').setAttribute('aria-pressed', String(ytPrefs.rate !== 1))
@@ -854,8 +870,9 @@
         applyYtPrefs()
         renderVideos()
       }
-      async function playVideo(v) {
+      async function playVideo(v, { startTime = 0 } = {}) {
         playing = v
+        playedIds.add(v.id)
         renderVideos()
         video.pause()
         video.hidden = true
@@ -885,6 +902,11 @@
           videoUrl = URL.createObjectURL(new Blob(parts, { type: mime }))
           video.poster = audioOnly ? (v.thumb || '') : ''
           video.src = videoUrl
+          if (startTime > 0) {
+            video.addEventListener('loadedmetadata', () => {
+              if (playing === v && Number.isFinite(video.duration)) video.currentTime = Math.min(startTime, Math.max(0, video.duration - 0.2))
+            }, { once: true })
+          }
           video.playbackRate = ytPrefs.rate
           video.hidden = false
           $('yt-screen').hidden = true
@@ -915,12 +937,159 @@
       orca.plugin?.on?.('youtube.progress', ({ id, percent }) => {
         if (id === playing?.id && video.hidden) loading(`유튜브에서 받는 중 ${percent}%`)
       })
+      // 상단의 다른 플러그인으로 이동해 패널이 닫혀도 worker가 이어 재생할 수 있게 상태를 동기화한다.
+      let lastSyncAt = 0
+      let panelHidden = false
+      function currentPlaybackState(withQueue = true) {
+        if (!audio.paused && current >= 0 && tracks[current]?.file?.remote) {
+          const t = tracks[current]
+          return {
+            kind: 'music',
+            trackId: t.file.id,
+            path: t.file.webkitRelativePath,
+            time: audio.currentTime,
+            volume: audio.volume,
+            muted: audio.muted,
+            rate: 1,
+            playing: true,
+            repeat: prefs.repeat,
+            shuffle: prefs.shuffle,
+            queue: withQueue ? tracks.filter((x) => x.file.remote).map((x) => ({ id: x.file.id, path: x.file.webkitRelativePath })) : undefined
+          }
+        }
+        if (!video.paused && playing?.id) {
+          return {
+            kind: 'youtube',
+            video: { id: playing.id, title: playing.title, channel: playing.channel, length: playing.length, views: playing.views, published: playing.published },
+            audioOnly: ytPrefs.audioOnly,
+            time: video.currentTime,
+            volume: video.volume,
+            muted: video.muted,
+            rate: ytPrefs.rate,
+            playing: true,
+            autoplay: ytPrefs.autoplay,
+            playedIds: [...playedIds],
+            queue: videos.map(({ thumb, ...rest }) => rest)
+          }
+        }
+        return { playing: false }
+      }
+      let lastQueueAt = 0
+      function syncPlaybackState(force = false) {
+        const now = Date.now()
+        if (!force && now - lastSyncAt < 900) return
+        lastSyncAt = now
+        // 음악 큐는 길 수 있어 10초에 한 번만 보낸다(worker가 이전 큐를 유지한다). 상태가 바뀌는 첫 보고에는 항상 포함된다.
+        const withQueue = now - lastQueueAt > 10000
+        if (withQueue) lastQueueAt = now
+        request('playback.state', currentPlaybackState(withQueue)).catch(() => {})
+      }
+      let pausedByHandoff = null
+      function handoffToWorker() {
+        panelHidden = true
+        const state = currentPlaybackState()
+        if (!state.playing) return
+        // 패널이 닫히지 않고 숨겨지기만 해도 소리가 겹치지 않게 패널 쪽은 멈춘다.
+        pausedByHandoff = state.kind === 'music' ? audio : video
+        pausedByHandoff.pause()
+        request('playback.handoff', state).catch(() => {})
+      }
+      async function resumeFromBackground(takeover) {
+        const bgState = takeover?.active ? takeover.state : null
+        if (!bgState) return false
+        if (bgState.kind === 'music' && tracks.length) {
+          showTab('music')
+          const idx = tracks.findIndex((t) => t.file.webkitRelativePath === bgState.path)
+          if (idx >= 0) play(idx, { startTime: bgState.time || 0 })
+          return true
+        }
+        if (bgState.kind === 'youtube' && bgState.video?.id) {
+          showTab('youtube')
+          for (const id of bgState.playedIds ?? []) playedIds.add(id)
+          if (Array.isArray(bgState.queue) && bgState.queue.length && !videos.length) {
+            videos = bgState.queue
+            renderVideos()
+          }
+          playVideo(bgState.video, { startTime: bgState.time || 0 })
+          return true
+        }
+        return false
+      }
+      // 패널이 닫히면 worker가 이 요청의 중단으로 바로 알아채고 재생을 이어받는다(25초마다 갱신).
+      ;(async function watchPanel() {
+        for (;;) {
+          try {
+            await request('playback.watch', {}, 30000)
+          } catch {
+            await sleep(1000)
+          }
+        }
+      })()
+      window.addEventListener('pagehide', handoffToWorker)
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) handoffToWorker()
+        else {
+          panelHidden = false
+          const paused = pausedByHandoff
+          pausedByHandoff = null
+          request('playback.takeover', {})
+            .then(async (res) => {
+              if (!(await resumeFromBackground(res)) && paused) paused.play().catch(() => {})
+            })
+            .catch(() => paused?.play().catch(() => {}))
+        }
+      })
+      setInterval(() => {
+        if (!panelHidden && (!audio.paused || !video.paused)) syncPlaybackState(true)
+      }, 400)
+
       // 음악과 유튜브가 겹쳐 나오지 않게 한쪽이 재생되면 다른 쪽을 멈춘다.
       video.addEventListener('play', () => {
         video.playbackRate = ytPrefs.rate
         audio.pause()
+        syncPlaybackState(true)
       })
+      video.addEventListener('pause', () => !panelHidden && syncPlaybackState(true))
+      // 음악과 유튜브가 같은 음량을 쓰고, 영상 컨트롤에서 바꾼 값도 기억한다.
+      video.addEventListener('volumechange', () => {
+        if (video.volume !== prefs.volume) {
+          prefs.volume = video.volume
+          audio.volume = video.volume
+          $('volume').value = video.volume
+          savePrefs()
+        }
+        syncPlaybackState(true)
+      })
+      video.addEventListener('ratechange', () => syncPlaybackState(true))
+      video.addEventListener('timeupdate', () => !panelHidden && !video.paused && syncPlaybackState())
       video.addEventListener('loadedmetadata', () => (video.playbackRate = ytPrefs.rate))
+      video.addEventListener('ended', async () => {
+        if (!ytPrefs.autoplay || !playing) return
+        const finished = playing
+        const idx = videos.findIndex((v) => v.id === finished.id)
+        if (idx >= 0 && idx + 1 < videos.length) {
+          const next = videos[idx + 1]
+          setStatus(`다음 영상 자동 재생: ${next.title}`)
+          return playVideo(next)
+        }
+        // 조회결과가 1건이거나 마지막 영상(또는 URL 직접 재생)이면 유튜브 추천 다음 영상을 이어서 재생한다.
+        setStatus('다음 추천 영상을 찾는 중…')
+        try {
+          const output = await request('youtube.related', { id: finished.id, limit: 10 })
+          if (playing !== finished || !ytPrefs.autoplay) return
+          const related = output.videos ?? []
+          const next = related.find((v) => !playedIds.has(v.id)) ?? related[0]
+          if (!next) return setStatus('이어서 재생할 다음 영상을 찾지 못했습니다.')
+          if (!videos.some((v) => v.id === next.id)) {
+            videos.push(next)
+            renderVideos()
+          }
+          setStatus(`다음 영상 자동 재생: ${next.title}`)
+          playVideo(next)
+        } catch (error) {
+          if (playing === finished) setStatus(`다음 영상을 찾지 못했습니다: ${error.message}`, true)
+        }
+      })
       audio.addEventListener('play', () => video.pause())
 
       function showFavorites() {
@@ -997,6 +1166,11 @@
         if (topic === 'favorites') showFavorites()
         else loadPopular(topic)
       }
+      $('yt-autoplay').onclick = () => {
+        ytPrefs.autoplay = !ytPrefs.autoplay
+        applyYtPrefs()
+        saveYtPrefs()
+      }
       $('yt-audio').onclick = () => {
         ytPrefs.audioOnly = !ytPrefs.audioOnly
         applyYtPrefs()
@@ -1011,6 +1185,7 @@
       // 재생과 받는 중인 영상을 멈추고, 메모리와 검색 화면을 기본 목록으로 돌린다.
       $('yt-reset').onclick = () => {
         playing = null
+        playedIds.clear()
         video.pause()
         video.removeAttribute('src')
         video.removeAttribute('poster')
@@ -1055,8 +1230,9 @@
         orca.storage.get('prefs').catch(() => null),
         orca.storage.get('musicFolder').catch(() => null),
         orca.storage.get('ytPrefs').catch(() => null),
-        orca.storage.get('ytFavorites').catch(() => null)
-      ]).then(async ([savedPrefs, savedFolder, savedYtPrefs, savedFavs]) => {
+        orca.storage.get('ytFavorites').catch(() => null),
+        request('playback.takeover', {}).catch(() => null)
+      ]).then(async ([savedPrefs, savedFolder, savedYtPrefs, savedFavs, takeover]) => {
         if (savedPrefs && typeof savedPrefs === 'object') {
           Object.assign(prefs, savedPrefs)
           applyPrefs()
@@ -1064,13 +1240,19 @@
         if (savedYtPrefs && typeof savedYtPrefs === 'object') {
           if (savedYtPrefs.topic === 'favorites' || YT_TOPICS[savedYtPrefs.topic]) ytPrefs.topic = savedYtPrefs.topic
           if (typeof savedYtPrefs.audioOnly === 'boolean') ytPrefs.audioOnly = savedYtPrefs.audioOnly
+          if (typeof savedYtPrefs.autoplay === 'boolean') ytPrefs.autoplay = savedYtPrefs.autoplay
           if (YT_RATES.includes(savedYtPrefs.rate)) ytPrefs.rate = savedYtPrefs.rate
         }
         if (Array.isArray(savedFavs)) ytFavorites = savedFavs.filter((f) => f && typeof f.id === 'string').slice(0, 50)
         applyYtPrefs()
-        try {
-          if (localStorage.getItem('tab') === 'youtube') showTab('youtube')
-        } catch {}
+        const bgState = takeover?.active ? takeover.state : null
+        if (bgState?.kind === 'youtube') showTab('youtube')
+        else if (bgState?.kind === 'music') showTab('music')
+        else {
+          try {
+            if (localStorage.getItem('tab') === 'youtube') showTab('youtube')
+          } catch {}
+        }
         if (typeof savedFolder === 'string' && savedFolder && !tracks.length) {
           try {
             const result = await request('music.loadFolder', { path: savedFolder })
@@ -1078,6 +1260,7 @@
             else if (result.files?.length && !tracks.length) addFiles(result.files.map((f) => new RemoteFile(f)), { autoplay: false })
           } catch {}
         }
+        await resumeFromBackground(takeover)
       })
 
       // 가사/플레이어 아래 손잡이를 끌어 높이를 바꾸고, 다음에 열 때도 유지한다.

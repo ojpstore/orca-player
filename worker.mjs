@@ -104,12 +104,12 @@ export const POPULAR_PRESETS = {
   news: { query: '뉴스 OR 경제 OR 시사', sp: POPULAR_TODAY_SP }
 }
 
-// YouTube 공식 차트 재생목록(lockupViewModel)에서 영상 목록을 뽑는다.
-export function parsePlaylist(html) {
+// YouTube 재생목록 및 watch 관련 영상(lockupViewModel)에서 영상 목록을 뽑는다.
+export function parsePlaylist(html, { excludeId = '' } = {}) {
   const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/s)
-  if (!match) throw new Error('유튜브 재생목록을 읽지 못했습니다. 네트워크(회사 보안 등)에서 차단되었을 수 있습니다.')
+  if (!match) throw new Error('유튜브 영상 목록을 읽지 못했습니다. 네트워크(회사 보안 등)에서 차단되었을 수 있습니다.')
   const videos = []
-  const seen = new Set()
+  const seen = new Set(excludeId ? [excludeId] : [])
   const walk = (value) => {
     if (!value || typeof value !== 'object') return
     const m = value.lockupViewModel
@@ -128,9 +128,34 @@ export function parsePlaylist(html) {
       })
       return
     }
+    const c = value.compactVideoRenderer
+    if (c?.videoId && !seen.has(c.videoId)) {
+      seen.add(c.videoId)
+      videos.push({
+        id: c.videoId,
+        title: text(c.title),
+        channel: text(c.longBylineText) || text(c.shortBylineText),
+        length: text(c.lengthText),
+        views: text(c.shortViewCountText).replace(/^조회수\s+(.+?)회$/, '$1'),
+        published: text(c.publishedTimeText)
+      })
+      return
+    }
     for (const child of Object.values(value)) walk(child)
   }
   walk(JSON.parse(match[1]))
+  return videos
+}
+
+export async function relatedYoutube(id, { limit = 10, fetchImpl = fetch } = {}) {
+  if (!/^[\w-]{11}$/.test(id ?? '')) throw new Error('잘못된 영상 id입니다.')
+  const url = `https://www.youtube.com/watch?v=${id}&hl=ko&gl=KR`
+  const res = await fetchImpl(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15000) }).catch((error) => {
+    throw new Error(`유튜브에 연결하지 못했습니다 (${error.cause?.code ?? error.cause?.message ?? error.message})`)
+  })
+  if (!res.ok) throw new Error(`유튜브 응답 ${res.status}`)
+  const videos = parsePlaylist(await res.text(), { excludeId: id }).slice(0, limit)
+  await Promise.all(videos.map(async (video) => (video.thumb = await thumbnail(video.id, fetchImpl))))
   return videos
 }
 
@@ -286,7 +311,7 @@ function downloadVideo(ytdlp, id, file, onProgress, signal, { audioOnly = false 
 // 한 번에 한 영상만 받아 두고, 새 영상을 받을 때 이전 파일을 지운다.
 // 패널 요청은 최대 2분이라 다운로드는 뒤에서 돌리고, 끝나지 않았으면 pending을 돌려 패널이 다시 묻게 한다.
 // 새 영상을 고르면 이전 다운로드는 중단하고, 작업마다 다른 파일에 받아 A→B→A에서도 같은 파일에 겹쳐 쓰지 않는다.
-export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
+export function videoFetcher({ dir, find, download, post, wait = 90000, keepFile = false }) {
   let current = null // { id, key, file, size, audioOnly }
   let job = null // { id, key, abort, promise } — 완료 판정은 id가 아니라 이 객체로 한다.
   let seq = 0
@@ -348,10 +373,11 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
       const buffer = Buffer.alloc(Math.min(CHUNK_BYTES, current.size - offset))
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
       const data = buffer.subarray(0, bytesRead).toString('base64')
-      // 마지막 조각까지 패널에 넘겼으면 패널이 blob으로 들고 있으므로 임시 파일은 지운다.
+      // 마지막 조각까지 패널에 넘겼으면 keepFile이 아닐 때 임시 파일을 지운다.
+      // keepFile이면 다른 플러그인으로 이동했을 때 백그라운드 이어 재생에 재사용하고, 새 영상/reset 때 지운다.
       const last = offset + bytesRead >= current.size
       await handle.close()
-      if (last) {
+      if (last && !keepFile) {
         const { file } = current
         current = null
         await discard(file)
@@ -371,7 +397,9 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
     if (old) await discard(old.file)
   }
 
-  return { fetch: fetchVideo, chunk, reset }
+  const fileFor = (id) => (current?.id === id ? current.file : null)
+
+  return { fetch: fetchVideo, chunk, reset, fileFor }
 }
 
 // --- 음악 폴더 고르기: 패널(브라우저)의 폴더 선택 창 대신 윈도 기본 폴더 트리 창을 띄운다.
@@ -565,6 +593,370 @@ const orca = (args) =>
     )
   })
 
+// --- 백그라운드 이어 재생: 상단의 다른 플러그인으로 이동해 패널이 닫혀도 worker에서 오디오를 이어 재생한다.
+const BG_PLAYER_CS = `
+using System;
+using System.Globalization;
+using System.Threading;
+using System.Windows.Media;
+using System.Windows.Threading;
+public class OrcaBgPlayer {
+  public static void Run() {
+    var disp = Dispatcher.CurrentDispatcher;
+    var mp = new MediaPlayer();
+    double pendingSec = 0;
+    double pendingRate = 1;
+    bool autoplay = true;
+    bool opened = false;
+    mp.MediaOpened += (s, e) => {
+      opened = true;
+      if (autoplay) {
+        if (pendingSec > 0) mp.Position = TimeSpan.FromSeconds(pendingSec);
+        mp.SpeedRatio = pendingRate;
+        mp.Play();
+      }
+      Console.Out.WriteLine("OPENED");
+      Console.Out.Flush();
+    };
+    mp.MediaEnded += (s, e) => {
+      Console.Out.WriteLine("ENDED");
+      Console.Out.Flush();
+    };
+    mp.MediaFailed += (s, e) => {
+      Console.Out.WriteLine("ERR " + (e.ErrorException != null ? e.ErrorException.Message : "failed"));
+      Console.Out.Flush();
+    };
+    new Thread(() => {
+      string line;
+      while ((line = Console.In.ReadLine()) != null) {
+        var cmd = line;
+        disp.Invoke(() => {
+          var parts = cmd.Split('\\t');
+          if (parts[0] == "PLAY" && parts.Length >= 5) {
+            mp.Stop();
+            autoplay = true;
+            opened = false;
+            pendingSec = double.Parse(parts[2], CultureInfo.InvariantCulture);
+            mp.Volume = double.Parse(parts[3], CultureInfo.InvariantCulture);
+            pendingRate = double.Parse(parts[4], CultureInfo.InvariantCulture);
+            mp.Open(new Uri(parts[1]));
+          } else if (parts[0] == "LOAD" && parts.Length >= 2) {
+            // 소리 없이 파일만 열어 둔다. GO가 오면 바로 재생한다.
+            mp.Stop();
+            autoplay = false;
+            opened = false;
+            mp.Volume = 0;
+            mp.Open(new Uri(parts[1]));
+          } else if (parts[0] == "GO" && parts.Length >= 4) {
+            pendingSec = double.Parse(parts[1], CultureInfo.InvariantCulture);
+            mp.Volume = double.Parse(parts[2], CultureInfo.InvariantCulture);
+            pendingRate = double.Parse(parts[3], CultureInfo.InvariantCulture);
+            autoplay = true;
+            if (opened) {
+              mp.Position = TimeSpan.FromSeconds(pendingSec);
+              mp.SpeedRatio = pendingRate;
+              mp.Play();
+            }
+          } else if (parts[0] == "STOP") {
+            opened = false;
+            double pos = mp.Source != null ? mp.Position.TotalSeconds : 0;
+            mp.Stop();
+            mp.Close();
+            Console.Out.WriteLine("STOPPED " + pos.ToString(CultureInfo.InvariantCulture));
+            Console.Out.Flush();
+          } else if (parts[0] == "EXIT") {
+            mp.Close();
+            disp.BeginInvokeShutdown(DispatcherPriority.Normal);
+          }
+        });
+      }
+      disp.BeginInvokeShutdown(DispatcherPriority.Normal);
+    }) { IsBackground = true }.Start();
+    Console.Out.WriteLine("READY");
+    Console.Out.Flush();
+    Dispatcher.Run();
+  }
+}
+`
+const BG_PLAYER_SCRIPT = `Add-Type -ReferencedAssemblies PresentationCore, WindowsBase -TypeDefinition "${BG_PLAYER_CS.replace(/"/g, '""')}"\n[Console]::InputEncoding = [Text.Encoding]::UTF8\n[Console]::OutputEncoding = [Text.Encoding]::UTF8\n[OrcaBgPlayer]::Run()`
+
+export function createBgPlayer(log = () => {}) {
+  let child = null
+  let ready = null
+  let stopWaiter = null
+  let endedHandler = null
+  let loadedFile = null // 소리 없이 열어 둔 파일(preload)
+  let gen = 0 // stop()마다 올려서, 아직 시작 중이던 play()가 stop 뒤에 되살아나지 않게 한다.
+
+  function ensure() {
+    if (child && !child.killed && child.exitCode === null) return ready
+    ready = new Promise((resolve, reject) => {
+      log('[bg] spawning powershell')
+      const proc = spawn(
+        'powershell.exe',
+        ['-NoProfile', '-STA', '-EncodedCommand', Buffer.from(BG_PLAYER_SCRIPT, 'utf16le').toString('base64')],
+        { windowsHide: true }
+      )
+      child = proc
+      let buf = ''
+      let settled = false
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true
+          reject(new Error('bg player timeout'))
+        }
+      }, 10000)
+      proc.stdout.on('data', (chunk) => {
+        buf += String(chunk)
+        for (let nl = buf.indexOf('\n'); nl >= 0; nl = buf.indexOf('\n')) {
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          log(`[bg] ps: ${line}`)
+          if (line === 'READY' && !settled) {
+            settled = true
+            clearTimeout(timer)
+            resolve(proc)
+          } else if (line.startsWith('STOPPED ') && stopWaiter) {
+            const w = stopWaiter
+            stopWaiter = null
+            w(Number(line.slice(8)) || 0)
+          } else if (line === 'ENDED') {
+            loadedFile = null
+            endedHandler?.()
+          }
+        }
+      })
+      proc.on('error', (err) => {
+        log(`[bg] ps error: ${err.message}`)
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(err)
+        }
+      })
+      proc.on('close', (code) => {
+        log(`[bg] ps close: ${code}`)
+        if (child === proc) {
+          child = null
+          loadedFile = null
+        }
+        if (stopWaiter) {
+          const w = stopWaiter
+          stopWaiter = null
+          w(0)
+        }
+      })
+    })
+    ready.catch(() => {})
+    return ready
+  }
+
+  return {
+    warmup() {
+      ensure().catch(() => {})
+    },
+    async play(filePath, { time = 0, volume = 0.8, rate = 1 } = {}) {
+      const g = gen
+      const proc = await ensure()
+      if (g !== gen) return
+      const cleanPath = String(filePath).replace(/[\t\r\n]/g, '')
+      const vol = Math.min(1, Math.max(0, Number(volume) || 0))
+      const spd = Math.max(0.25, Number(rate) || 1)
+      if (loadedFile === cleanPath) {
+        loadedFile = null // 이미 열려 있으니 위치·음량만 지정해 바로 재생
+        proc.stdin.write(`GO\t${Math.max(0, Number(time) || 0)}\t${vol}\t${spd}\n`)
+        return
+      }
+      loadedFile = null
+      proc.stdin.write(`PLAY\t${cleanPath}\t${Math.max(0, Number(time) || 0)}\t${Math.min(1, Math.max(0, Number(volume) || 0))}\t${Math.max(0.25, Number(rate) || 1)}\n`)
+    },
+    // 곧 이어 재생할 파일을 소리 없이 미리 열어 둔다. 전환 때 시작 지연을 줄인다.
+    async preload(filePath) {
+      const clean = String(filePath).replace(/[\t\r\n]/g, '')
+      if (loadedFile === clean) return
+      const g = gen
+      const proc = await ensure()
+      if (g !== gen || loadedFile === clean) return
+      loadedFile = clean
+      proc.stdin.write(`LOAD\t${clean}\n`)
+    },
+    async stop() {
+      gen++
+      loadedFile = null
+      if (!child || child.killed || child.exitCode !== null) return 0
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          if (stopWaiter === done) stopWaiter = null
+          resolve(0)
+        }, 2000)
+        const done = (pos) => {
+          clearTimeout(timer)
+          resolve(pos)
+        }
+        stopWaiter = done
+        try {
+          child.stdin.write('STOP\n')
+        } catch {
+          done(0)
+        }
+      })
+    },
+    onEnded(fn) {
+      endedHandler = fn
+    },
+    dispose() {
+      if (!child) return
+      try {
+        child.stdin.write('EXIT\n')
+      } catch {}
+      const proc = child
+      child = null
+      loadedFile = null
+      setTimeout(() => {
+        try {
+          if (proc.exitCode === null) proc.kill()
+        } catch {}
+      }, 500)
+    }
+  }
+}
+
+// 패널이 닫히거나(pagehide -> handoff) 재생 중 하트비트가 끊기면 worker가 백그라운드 재생을 이어받고, 다시 열리면(takeover) 패널로 되돌린다.
+export function playbackCoordinator({ player, resolveFile, nextItem, now = Date.now, staleMs = 1200, log = () => {} }) {
+  let lastState = null // 패널이 마지막으로 보고한 상태
+  let bgState = null // 현재 백그라운드에서 재생 중인 상태
+  let handoffSeq = 0
+  let staleTimer = null
+  let preloadKey = null // 이미 미리 열었거나 여는 중인 곡
+
+  // 재생 중인 파일을 worker 플레이어에 소리 없이 미리 열어 두면 전환 때 바로 이어진다.
+  function preload(state) {
+    if (bgState || !player.preload) return
+    const key = `${state.kind}:${state.kind === 'music' ? state.trackId : state.video?.id}`
+    if (key === preloadKey) return
+    preloadKey = key
+    Promise.resolve(resolveFile(state, { preload: true }))
+      .then((file) => {
+        if (!file) preloadKey = null // 아직 받는 중일 수 있어 다음 하트비트에 다시 본다.
+        else if (preloadKey === key && !bgState) return player.preload(file)
+      })
+      .catch(() => (preloadKey = null))
+  }
+
+  const clearStale = () => {
+    if (staleTimer) {
+      clearTimeout(staleTimer)
+      staleTimer = null
+    }
+  }
+
+  async function startBg(state, time) {
+    clearStale()
+    const seq = ++handoffSeq
+    const t0 = now()
+    const file = await Promise.resolve(resolveFile(state)).catch(() => null)
+    if (seq !== handoffSeq) return
+    if (!file) return log(`[bg] 이어 재생할 파일을 찾지 못했습니다 kind=${state.kind}`)
+    time += Math.max(0, (now() - t0) / 1000) * (state.rate || 1) // 파일을 다시 받느라 걸린 시간만큼 보정
+    log(`[bg] start kind=${state.kind} time=${time.toFixed(1)}`)
+    bgState = { ...state, time, startedAt: now() }
+    try {
+      await player.play(file, { time, volume: state.muted ? 0 : state.volume, rate: state.rate || 1 })
+      if (seq !== handoffSeq) return
+    } catch (error) {
+      log(`[bg] play 실패: ${error.message}`)
+      if (seq === handoffSeq) bgState = null
+    }
+  }
+
+  player.onEnded(async () => {
+    const ended = bgState
+    if (!ended) return
+    const seq = handoffSeq
+    const next = await nextItem?.(ended).catch(() => null)
+    if (seq !== handoffSeq || !bgState) return
+    if (!next) {
+      bgState = null
+      return
+    }
+    lastState = { ...next, playing: true, time: 0, updatedAt: now() }
+    await startBg(lastState, 0)
+  })
+
+  return {
+    updateState(state) {
+      clearStale()
+      // 패널이 살아 있다는 뜻이다. 끊김을 잘못 판단해 이어받았다면 겹치지 않게 백그라운드는 멈춘다(방금 시작한 경우는 이전 하트비트일 수 있어 둔다).
+      if (bgState && now() - bgState.startedAt > 1500) {
+        log('[bg] 패널 하트비트 재개 → 백그라운드 중지')
+        bgState = null
+        handoffSeq++
+        player.stop()
+      }
+      if (!state || typeof state !== 'object' || !state.playing) {
+        lastState = null
+        return { ok: true }
+      }
+      lastState = { ...state, queue: state.queue ?? lastState?.queue, updatedAt: now() }
+      player.warmup?.()
+      preload(lastState)
+      staleTimer = setTimeout(() => {
+        staleTimer = null
+        if (lastState?.playing && !bgState) {
+          log('[bg] 하트비트 끊김 → 이어받기')
+          const elapsed = Math.max(0, (now() - lastState.updatedAt) / 1000) * (lastState.rate || 1)
+          startBg(lastState, (lastState.time || 0) + elapsed)
+        }
+      }, staleMs)
+      return { ok: true }
+    },
+    handoff(state) {
+      log(`[bg] handoff playing=${Boolean(state?.playing)} bg=${Boolean(bgState)}`)
+      clearStale()
+      const target = state?.playing ? { ...state, updatedAt: now() } : lastState
+      if (!target?.playing || bgState) return { ok: true }
+      lastState = target
+      const elapsed = Math.max(0, (now() - target.updatedAt) / 1000) * (target.rate || 1)
+      startBg(target, (target.time || 0) + elapsed)
+      return { ok: true }
+    },
+    async takeover() {
+      clearStale()
+      preloadKey = null
+      handoffSeq++
+      if (!bgState) return { active: false }
+      const state = bgState
+      bgState = null
+      const pos = await player.stop()
+      const time = pos > 0 ? pos : (state.time || 0) + Math.max(0, (now() - state.startedAt) / 1000) * (state.rate || 1)
+      lastState = { ...state, time, playing: true, updatedAt: now() }
+      return { active: true, state: { ...state, time } }
+    },
+    async stop() {
+      clearStale()
+      preloadKey = null
+      handoffSeq++
+      lastState = null
+      if (!bgState) return
+      bgState = null
+      await player.stop()
+    },
+    dispose() {
+      clearStale()
+      preloadKey = null
+      handoffSeq++
+      bgState = null
+      lastState = null
+      player.dispose?.()
+    }
+  }
+}
+
+let activeDispose = null
+export function deactivate() {
+  return activeDispose?.()
+}
+
 export default function activate(plugin) {
   // 처음엔 새 탭을 열고, 그 뒤로는 같은 탭을 이동시킨다. 사용자가 탭을 닫았으면 다시 연다.
   let pageId = null
@@ -589,6 +981,13 @@ export default function activate(plugin) {
   plugin.panels.handle('youtube.popular', async ({ topic } = {}) => {
     try {
       return { videos: await popularYoutube({ topic }) }
+    } catch (error) {
+      return { error: error.message }
+    }
+  })
+  plugin.panels.handle('youtube.related', async ({ id, limit = 10 } = {}) => {
+    try {
+      return { videos: await relatedYoutube(id, { limit }) }
     } catch (error) {
       return { error: error.message }
     }
@@ -621,8 +1020,101 @@ export default function activate(plugin) {
     }
   })
 
-  const videos = videoFetcher({ dir: VIDEO_DIR, find: () => findYtDlp(), download: downloadVideo, post: (name, data) => plugin.panels.post(name, data) })
+  const videos = videoFetcher({ dir: VIDEO_DIR, find: () => findYtDlp(), download: downloadVideo, post: (name, data) => plugin.panels.post(name, data), keepFile: true })
+  const bg = playbackCoordinator({
+    player: createBgPlayer((m) => plugin.log(m)),
+    log: (m) => plugin.log(m),
+    resolveFile: async (state, opts = {}) => {
+      let f = state.kind === 'music' ? (library[state.trackId] ?? null) : state.kind === 'youtube' ? videos.fileFor(state.video?.id) : null
+      if (opts.preload) return f // 미리 열기는 다운로드를 건드리지 않는다(패널이 받는 영상을 끊지 않도록).
+      // worker가 재시작돼 받아 둔 영상을 잃었으면 오디오만 다시 받아 이어 재생한다.
+      if (!f && state.kind === 'youtube' && state.video?.id) {
+        let res
+        do res = await videos.fetch(state.video.id, { audioOnly: true })
+        while (res?.pending)
+        f = res?.error || res?.needsYtDlp ? null : videos.fileFor(state.video.id)
+      }
+      plugin.log(`[bg] resolveFile kind=${state.kind} -> ${f}`)
+      return f
+    },
+    nextItem: async (ended) => {
+      if (ended.kind === 'music' && Array.isArray(ended.queue) && ended.queue.length) {
+        const idx = ended.queue.findIndex((item) => item.id === ended.trackId)
+        if (idx < 0) return null
+        if (ended.repeat === 'one') return ended
+        let nextIdx = -1
+        if (ended.shuffle && ended.queue.length > 1) {
+          nextIdx = idx
+          while (nextIdx === idx) nextIdx = Math.floor(Math.random() * ended.queue.length)
+        } else if (idx + 1 < ended.queue.length) {
+          nextIdx = idx + 1
+        } else if (ended.repeat === 'all') {
+          nextIdx = 0
+        }
+        if (nextIdx < 0) return null
+        const target = ended.queue[nextIdx]
+        return { ...ended, trackId: target.id, path: target.path }
+      }
+      if (ended.kind === 'youtube' && ended.autoplay && ended.video?.id) {
+        const queue = Array.isArray(ended.queue) ? ended.queue : []
+        const played = new Set([...(ended.playedIds ?? []), ended.video.id])
+        const idx = queue.findIndex((v) => v.id === ended.video.id)
+        let next = idx >= 0 && idx + 1 < queue.length ? queue[idx + 1] : null
+        let nextQueue = queue
+        if (!next) {
+          const related = await relatedYoutube(ended.video.id, { limit: 10 }).catch(() => [])
+          next = related.find((v) => !played.has(v.id)) ?? related[0] ?? null
+          if (next && !nextQueue.some((v) => v.id === next.id)) nextQueue = [...nextQueue, next]
+        }
+        if (!next) return null
+        let res
+        do res = await videos.fetch(next.id, { audioOnly: Boolean(ended.audioOnly) })
+        while (res?.pending)
+        if (res?.error || res?.needsYtDlp) return null
+        return { ...ended, video: next, queue: nextQueue, playedIds: [...played, next.id] }
+      }
+      return null
+    }
+  })
+  activeDispose = async () => {
+    bg.dispose()
+    await videos.reset()
+  }
+
   plugin.panels.handle('youtube.fetch', ({ id, audioOnly = false } = {}) => videos.fetch(id, { audioOnly }))
-  plugin.panels.handle('youtube.reset', () => videos.reset())
+  plugin.panels.handle('youtube.reset', async () => {
+    await bg.stop()
+    return videos.reset()
+  })
   plugin.panels.handle('youtube.chunk', ({ id, offset = 0 } = {}) => videos.chunk(id, offset))
+  plugin.panels.handle('playback.state', (state) => bg.updateState(state))
+  plugin.panels.handle('playback.handoff', (state) => {
+    plugin.log(`[bg] handoff kind=${state?.kind ?? ''} time=${state?.time?.toFixed?.(1) ?? ''}`)
+    return bg.handoff(state)
+  })
+  plugin.panels.handle('playback.takeover', async () => {
+    const res = await bg.takeover()
+    if (res.active) plugin.log(`[bg] takeover kind=${res.state?.kind ?? ''} time=${res.state?.time?.toFixed?.(1) ?? ''}`)
+    return res
+  })
+  plugin.panels.handle('playback.stop', () => bg.stop())
+  // 패널이 오래 걸리는 요청을 걸어 두면, 패널이 닫히는 순간 signal이 중단돼 하트비트 끊김을 기다리지 않고 바로 이어받는다.
+  // 요청 시간 초과와 구분되지 않으므로 25초마다 먼저 끝내고 패널이 다시 건다.
+  plugin.panels.handle('playback.watch', (_input, { signal }) =>
+    new Promise((resolve) => {
+      const done = (result) => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+        resolve(result)
+      }
+      const onAbort = () => {
+        plugin.log('[bg] 패널 닫힘 감지 → 즉시 이어받기')
+        bg.handoff(null)
+        done({ closed: true })
+      }
+      const timer = setTimeout(() => done({ renew: true }), 25000)
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    })
+  )
 }
