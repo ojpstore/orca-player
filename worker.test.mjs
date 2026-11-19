@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pickFolder, listMusic, readMusic, cliResult, findYtDlp, isYoutubeUrl, parseSearch, popularYoutube, POPULAR_AI_QUERY, POPULAR_TODAY_SP, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
+import { pickFolder, listMusic, loadMusicFolder, readMusic, cliResult, findYtDlp, isYoutubeUrl, parsePlaylist, parseSearch, popularYoutube, POPULAR_AI_QUERY, POPULAR_MUSIC_PLAYLIST, POPULAR_TODAY_SP, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
 
 // 손으로 끝낼 수 있는 가짜 yt-dlp. finish(내용)이면 파일을 쓰고 성공, fail()이면 실패한다.
 async function fakeFetcher() {
@@ -243,4 +243,83 @@ test('continuation 요청이 실패해도 첫 페이지 인기 영상은 그대�
   const list = await popularYoutube({ fetchImpl: fakeFetch })
   assert.equal(list.length, 1)
   assert.equal(list[0].id, 'vid_0000001')
+})
+
+test('음악 폴더 자동 복원은 존재하는 폴더만 읽고 없는 경로는 missing을 돌려준다', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'orca-music-restore-'))
+  await writeFile(join(root, 'song.mp3'), '1234')
+  const files = []
+  const ok = loadMusicFolder(root, files)
+  assert.equal(ok.root, root)
+  assert.equal(ok.files.length, 1)
+  assert.deepEqual(loadMusicFolder(join(root, 'missing-dir'), files), { missing: true })
+  assert.deepEqual(loadMusicFolder('', files), { missing: true })
+})
+
+test('유튜브 오디오 전용 모드는 같은 id라도 별도 작업으로 m4a와 audio/mp4를 반환한다', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orca-player-audio-'))
+  const runs = []
+  const download = (ytdlp, id, file, onProgress, signal, opts) =>
+    new Promise((resolve) => {
+      runs.push({ id, file, opts, finish: async (body) => (await writeFile(file, body), resolve(file)) })
+    })
+  const videos = videoFetcher({ dir, find: () => 'yt-dlp.exe', download, post: () => {}, wait: 50 })
+
+  const v = videos.fetch(A)
+  await tick()
+  await runs[0].finish('mp4data')
+  assert.deepEqual(await v, { size: 7 })
+  assert.equal(runs[0].opts.audioOnly, false)
+  assert.ok(runs[0].file.endsWith('.mp4'))
+
+  const a = videos.fetch(A, { audioOnly: true })
+  await tick()
+  await runs[1].finish('m4a')
+  assert.deepEqual(await a, { size: 3, mime: 'audio/mp4' })
+  assert.equal(runs[1].opts.audioOnly, true)
+  assert.ok(runs[1].file.endsWith('.m4a'))
+})
+
+test('인기 음악 프리셋은 공식 차트 재생목록(lockupViewModel)을 파싱한다', async () => {
+  const playlistData = {
+    contents: [
+      {
+        lockupViewModel: {
+          contentId: 'AAAAAAAAAAA',
+          metadata: {
+            lockupMetadataViewModel: {
+              title: { content: '인기곡 1' },
+              metadata: {
+                contentMetadataViewModel: {
+                  metadataRows: [
+                    { metadataParts: [{ text: { content: '아티스트' } }] },
+                    { metadataParts: [{ text: { content: '조회수 120만회' } }, { text: { content: '2일 전' } }] }
+                  ]
+                }
+              }
+            }
+          },
+          contentImage: {
+            thumbnailViewModel: {
+              overlays: [{ thumbnailBottomOverlayViewModel: { badges: [{ thumbnailBadgeViewModel: { text: '3:25' } }] } }]
+            }
+          }
+        }
+      }
+    ]
+  }
+  const html = `<script>var ytInitialData = ${JSON.stringify(playlistData)};</script>`
+  assert.deepEqual(parsePlaylist(html), [
+    { id: 'AAAAAAAAAAA', title: '인기곡 1', channel: '아티스트', length: '3:25', views: '120만', published: '2일 전' }
+  ])
+  const calls = []
+  const fakeFetch = async (url) => {
+    calls.push(url)
+    if (url.includes('/playlist?')) return { ok: true, text: async () => html }
+    return { ok: true, arrayBuffer: async () => new Uint8Array([9]).buffer }
+  }
+  const list = await popularYoutube({ topic: 'music', fetchImpl: fakeFetch })
+  assert.ok(calls[0].includes(`list=${POPULAR_MUSIC_PLAYLIST}`))
+  assert.equal(list.length, 1)
+  assert.equal(list[0].thumb, 'data:image/jpeg;base64,CQ==')
 })

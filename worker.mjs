@@ -92,10 +92,47 @@ const BROWSER_HEADERS = {
   'accept-language': 'ko-KR,ko;q=0.9'
 }
 
-// 기본 검색 결과: 오늘 업로드된 AI 기술 트렌드 인기 영상(조회수순) 30개.
+// 기본 검색 결과 프리셋: 주제별 오늘의 인기 영상 30개.
 export const POPULAR_AI_QUERY = 'AI 에이전트 OR 클로드 OR 제미나이 OR GPT OR LLM'
 export const POPULAR_TODAY_SP = 'CAMSBAgCEAE%3D'
+export const POPULAR_MUSIC_PLAYLIST = 'PL4fGSI1pDJn6Q7vxp4-2ETPMtSuAPuZ8Y' // YouTube 공식 '일간 인기 뮤직비디오 - 한국'
 export const POPULAR_LIMIT = 30
+export const POPULAR_PRESETS = {
+  ai: { query: POPULAR_AI_QUERY, sp: POPULAR_TODAY_SP },
+  music: { playlist: POPULAR_MUSIC_PLAYLIST },
+  dev: { query: '개발자 OR 프로그래밍 OR 코딩 OR GitHub', sp: POPULAR_TODAY_SP },
+  news: { query: '뉴스 OR 경제 OR 시사', sp: POPULAR_TODAY_SP }
+}
+
+// YouTube 공식 차트 재생목록(lockupViewModel)에서 영상 목록을 뽑는다.
+export function parsePlaylist(html) {
+  const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/s)
+  if (!match) throw new Error('유튜브 재생목록을 읽지 못했습니다. 네트워크(회사 보안 등)에서 차단되었을 수 있습니다.')
+  const videos = []
+  const seen = new Set()
+  const walk = (value) => {
+    if (!value || typeof value !== 'object') return
+    const m = value.lockupViewModel
+    if (m?.contentId && /^[\w-]{11}$/.test(m.contentId) && !seen.has(m.contentId)) {
+      seen.add(m.contentId)
+      const rows = m.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel?.metadataRows ?? []
+      const badges = m.contentImage?.thumbnailViewModel?.overlays?.flatMap((o) => o.thumbnailBottomOverlayViewModel?.badges ?? []) ?? []
+      const length = badges.map((b) => b.thumbnailBadgeViewModel?.text).find(Boolean) ?? ''
+      videos.push({
+        id: m.contentId,
+        title: m.metadata?.lockupMetadataViewModel?.title?.content ?? '',
+        channel: rows[0]?.metadataParts?.[0]?.text?.content ?? '',
+        length,
+        views: (rows[1]?.metadataParts?.[0]?.text?.content ?? '').replace(/^조회수\s+(.+?)회$/, '$1'),
+        published: rows[1]?.metadataParts?.[1]?.text?.content ?? ''
+      })
+      return
+    }
+    for (const child of Object.values(value)) walk(child)
+  }
+  walk(JSON.parse(match[1]))
+  return videos
+}
 
 // 패널은 외부 이미지를 못 불러서 썸네일을 data URL로 넘긴다. 실패한 썸네일은 비워 둔다.
 async function thumbnail(id, fetchImpl = fetch) {
@@ -151,8 +188,20 @@ export async function searchYoutube(query, { sp = '', limit = 0, fetchImpl = fet
   return result
 }
 
-export const popularYoutube = (options = {}) =>
-  searchYoutube(POPULAR_AI_QUERY, { sp: POPULAR_TODAY_SP, limit: POPULAR_LIMIT, ...options })
+export async function popularYoutube({ topic = 'ai', limit = POPULAR_LIMIT, fetchImpl = fetch } = {}) {
+  const preset = POPULAR_PRESETS[topic] ?? POPULAR_PRESETS.ai
+  if (preset.playlist) {
+    const url = `https://www.youtube.com/playlist?list=${preset.playlist}&hl=ko&gl=KR`
+    const res = await fetchImpl(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15000) }).catch((error) => {
+      throw new Error(`유튜브에 연결하지 못했습니다 (${error.cause?.code ?? error.cause?.message ?? error.message})`)
+    })
+    if (!res.ok) throw new Error(`유튜브 응답 ${res.status}`)
+    const videos = parsePlaylist(await res.text()).slice(0, limit)
+    await Promise.all(videos.map(async (video) => (video.thumb = await thumbnail(video.id, fetchImpl))))
+    return videos
+  }
+  return searchYoutube(preset.query, { sp: preset.sp, limit, fetchImpl })
+}
 
 // --- 패널 안 재생: 패널은 외부 미디어를 못 틀어서(CSP media-src 'self' blob:) yt-dlp로 받은 파일을 조각내 넘긴다.
 // ponytail: Windows 전용(yt-dlp.exe). 다른 OS가 필요하면 바이너리 이름과 설치 URL만 나누면 된다.
@@ -206,20 +255,21 @@ export function ytDlpError(stderr) {
 }
 
 // signal로 중단하면 spawn이 yt-dlp를 죽이고 AbortError로 끝난다.
-function downloadVideo(ytdlp, id, file, onProgress, signal) {
-  const ffmpeg = findFfmpeg()
-  if (!ffmpeg) return Promise.reject(new Error('ffmpeg가 필요합니다. 터미널에서 `winget install Gyan.FFmpeg` 실행 후 Orca를 다시 켜 주세요.'))
+function downloadVideo(ytdlp, id, file, onProgress, signal, { audioOnly = false } = {}) {
   const args = [
     // 회사 SSL 검사 인증서처럼 Windows에만 등록된 루트 인증서도 믿도록 OS 인증서 저장소를 쓴다.
-    '--compat-options', 'no-certifi',
-    // 유튜브가 영상+소리 한 파일 포맷(18)을 없애서 영상(avc1)+소리(m4a)를 ffmpeg로 합친다.
-    '-f', 'bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]/b[ext=mp4]',
-    '--merge-output-format', 'mp4',
-    '--ffmpeg-location', ffmpeg,
-    '--no-playlist', '--newline', '--force-overwrites',
-    '-o', file,
-    `https://www.youtube.com/watch?v=${id}`
+    '--compat-options', 'no-certifi'
   ]
+  if (audioOnly) {
+    // 오디오 전용 모드는 m4a 단일 스트림만 받아 ffmpeg 병합 없이 빠르고 가볍게 재생한다.
+    args.push('-f', 'ba[ext=m4a]/ba')
+  } else {
+    const ffmpeg = findFfmpeg()
+    if (!ffmpeg) return Promise.reject(new Error('ffmpeg가 필요합니다. 터미널에서 `winget install Gyan.FFmpeg` 실행 후 Orca를 다시 켜 주세요.'))
+    // 유튜브가 영상+소리 한 파일 포맷(18)을 없애서 영상(avc1)+소리(m4a)를 ffmpeg로 합친다.
+    args.push('-f', 'bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]/b[ext=mp4]', '--merge-output-format', 'mp4', '--ffmpeg-location', ffmpeg)
+  }
+  args.push('--no-playlist', '--newline', '--force-overwrites', '-o', file, `https://www.youtube.com/watch?v=${id}`)
   return new Promise((resolve, reject) => {
     const child = spawn(ytdlp, args, { windowsHide: true, signal })
     let stderr = ''
@@ -237,8 +287,8 @@ function downloadVideo(ytdlp, id, file, onProgress, signal) {
 // 패널 요청은 최대 2분이라 다운로드는 뒤에서 돌리고, 끝나지 않았으면 pending을 돌려 패널이 다시 묻게 한다.
 // 새 영상을 고르면 이전 다운로드는 중단하고, 작업마다 다른 파일에 받아 A→B→A에서도 같은 파일에 겹쳐 쓰지 않는다.
 export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
-  let current = null // { id, file, size }
-  let job = null // { id, abort, promise } — 완료 판정은 id가 아니라 이 객체로 한다.
+  let current = null // { id, key, file, size, audioOnly }
+  let job = null // { id, key, abort, promise } — 완료 판정은 id가 아니라 이 객체로 한다.
   let seq = 0
   // 영상 파일과, 영상+소리를 합치다 실패해 남는 조각(<이름>.f137.mp4, .part, .ytdl, .temp.mp4 등)을 함께 지운다.
   const discard = async (file) => {
@@ -247,15 +297,17 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
     await Promise.all([file, ...names.filter((n) => n.startsWith(prefix)).map((n) => join(dirname(file), n))].map((f) => rm(f, { force: true }).catch(() => {})))
   }
 
-  async function fetchVideo(id) {
+  async function fetchVideo(id, { audioOnly = false } = {}) {
     if (!/^[\w-]{11}$/.test(id ?? '')) return { error: '잘못된 영상 id입니다.' }
-    if (current?.id === id) return { size: current.size }
-    if (job?.id !== id) {
+    const key = `${id}:${audioOnly ? 'audio' : 'video'}`
+    const reply = (item) => (item.audioOnly ? { size: item.size, mime: 'audio/mp4' } : { size: item.size })
+    if (current?.key === key) return reply(current)
+    if (job?.key !== key) {
       const ytdlp = find()
       if (!ytdlp) return { needsYtDlp: true }
       job?.abort.abort()
-      const me = { id, abort: new AbortController() }
-      const file = join(dir, `${id}-${++seq}.mp4`)
+      const me = { id, key, abort: new AbortController() }
+      const file = join(dir, `${id}-${++seq}.${audioOnly ? 'm4a' : 'mp4'}`)
       const old = current
       current = null
       let last = -1
@@ -267,14 +319,14 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
             if (Math.floor(percent) === last) return
             last = Math.floor(percent)
             post('youtube.progress', { id, percent: last })
-          }, me.abort.signal)
+          }, me.abort.signal, { audioOnly })
         } catch (error) {
           await discard(file)
           throw error
         }
         // 그사이 다른 영상(같은 id의 새 작업 포함)을 눌렀으면 이 파일은 버린다.
         if (job !== me) return void (await discard(file))
-        current = { id, file, size: (await stat(file)).size }
+        current = { id, key, file, size: (await stat(file)).size, audioOnly }
       })()
       job = me
       me.promise.catch(() => {}).finally(() => job === me && (job = null))
@@ -283,7 +335,7 @@ export function videoFetcher({ dir, find, download, post, wait = 90000 }) {
     try {
       const done = await Promise.race([me.promise.then(() => true), new Promise((resolve) => setTimeout(resolve, wait, false))])
       // 밀려난 작업을 기다리던 요청은 pending으로 돌려 최신 작업을 다시 기다리게 한다.
-      return done && current?.id === id ? { size: current.size } : { pending: true }
+      return done && current?.key === key ? reply(current) : { pending: true }
     } catch (error) {
       return me.abort.signal.aborted ? { pending: true } : { error: error.message }
     }
@@ -450,7 +502,7 @@ async function pickMusic(wait = 90000) {
   if (!pick) {
     const me = (pick = { result: null })
     me.promise = pickFolder().then(
-      (root) => (me.result = root ? { files: listMusic(root) } : { cancelled: true }),
+      (root) => (me.result = root ? { root, files: listMusic(root) } : { cancelled: true }),
       (error) => (me.result = { error: error.message })
     )
   }
@@ -459,6 +511,17 @@ async function pickMusic(wait = 90000) {
   if (!me.result) return { pending: true }
   pick = null
   return me.result
+}
+
+// 저장해 둔 마지막 음악 폴더를 다시 연다. 폴더가 없어졌으면 missing을 돌려준다.
+export function loadMusicFolder(path, files = library) {
+  const root = String(path ?? '').trim()
+  try {
+    if (!root || !existsSync(root) || !statSync(root).isDirectory()) return { missing: true }
+    return { root, files: listMusic(root, files) }
+  } catch {
+    return { missing: true }
+  }
 }
 
 // worker는 Orca.exe로 실행되므로 그 옆의 번들 CLI를 먼저 쓴다.
@@ -523,9 +586,9 @@ export default function activate(plugin) {
     }
   }
   plugin.panels.handle('youtube.open', ({ query } = {}) => open(query))
-  plugin.panels.handle('youtube.popular', async () => {
+  plugin.panels.handle('youtube.popular', async ({ topic } = {}) => {
     try {
-      return { videos: await popularYoutube() }
+      return { videos: await popularYoutube({ topic }) }
     } catch (error) {
       return { error: error.message }
     }
@@ -546,6 +609,7 @@ export default function activate(plugin) {
   })
 
   plugin.panels.handle('music.pickFolder', () => pickMusic())
+  plugin.panels.handle('music.loadFolder', ({ path } = {}) => loadMusicFolder(path))
   plugin.panels.handle('music.read', ({ id, offset } = {}) => readMusic(id, offset))
 
   plugin.panels.handle('youtube.status', () => ({ ytdlp: findYtDlp() }))
@@ -558,7 +622,7 @@ export default function activate(plugin) {
   })
 
   const videos = videoFetcher({ dir: VIDEO_DIR, find: () => findYtDlp(), download: downloadVideo, post: (name, data) => plugin.panels.post(name, data) })
-  plugin.panels.handle('youtube.fetch', ({ id } = {}) => videos.fetch(id))
+  plugin.panels.handle('youtube.fetch', ({ id, audioOnly = false } = {}) => videos.fetch(id, { audioOnly }))
   plugin.panels.handle('youtube.reset', () => videos.reset())
   plugin.panels.handle('youtube.chunk', ({ id, offset = 0 } = {}) => videos.chunk(id, offset))
 }
