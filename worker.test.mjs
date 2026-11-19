@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pickFolder, listMusic, readMusic, cliResult, findYtDlp, isYoutubeUrl, parseSearch, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
+import { pickFolder, listMusic, readMusic, cliResult, findYtDlp, isYoutubeUrl, parseSearch, popularYoutube, POPULAR_AI_QUERY, POPULAR_TODAY_SP, videoFetcher, videoId, youtubeUrl, ytDlpError } from './worker.mjs'
 
 // 손으로 끝낼 수 있는 가짜 yt-dlp. finish(내용)이면 파일을 쓰고 성공, fail()이면 실패한다.
 async function fakeFetcher() {
@@ -176,4 +176,71 @@ test('초기화하면 받던 다운로드를 멈추고 받아 둔 영상 파일�
   await tick()
   await videos.reset()
   assert.equal(runs[1].signal.aborted, true) // 받는 중이던 것은 중단한다.
+})
+
+test('오늘의 AI 인기 영상은 continuation으로 중복 없이 30개를 채우고 조회수 형식을 맞춘다', async () => {
+  const item = (n, views) => ({
+    videoRenderer: {
+      videoId: `vid_${String(n).padStart(7, '0')}`,
+      title: { runs: [{ text: `AI 영상 ${n}` }] },
+      ownerText: { runs: [{ text: `채널 ${n}` }] },
+      lengthText: { simpleText: '5:00' },
+      shortViewCountText: { simpleText: views },
+      publishedTimeText: { simpleText: '3시간 전' }
+    }
+  })
+  const page1 = {
+    contents: [
+      ...Array.from({ length: 20 }, (_, i) => item(i + 1, `${20 - i}만`)),
+      { continuationItemRenderer: { continuationEndpoint: { continuationCommand: { token: 'TOK1' } } } }
+    ]
+  }
+  const page2 = {
+    onResponseReceivedCommands: [
+      item(20, '조회수 1만회'), // 첫 페이지와 중복 id는 건너뛴다.
+      ...Array.from({ length: 15 }, (_, i) => item(i + 21, `조회수 ${15 - i}천회`))
+    ]
+  }
+  const calls = []
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, method: init?.method ?? 'GET', body: init?.body })
+    if (url.startsWith('https://www.youtube.com/results?')) {
+      return { ok: true, text: async () => `<script>"INNERTUBE_API_KEY":"KEY123","INNERTUBE_CLIENT_VERSION":"2.2026"</script><script>var ytInitialData = ${JSON.stringify(page1)};</script>` }
+    }
+    if (url.startsWith('https://www.youtube.com/youtubei/v1/search?key=KEY123')) {
+      return { ok: true, json: async () => page2 }
+    }
+    return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2]).buffer }
+  }
+
+  const list = await popularYoutube({ fetchImpl: fakeFetch })
+  assert.equal(list.length, 30)
+  assert.equal(new Set(list.map((v) => v.id)).size, 30)
+  assert.equal(list[0].views, '20만')
+  assert.equal(list[20].id, 'vid_0000021')
+  assert.equal(list[20].views, '15천') // "조회수 15천회" -> "15천"
+  assert.equal(list[0].thumb, 'data:image/jpeg;base64,AQI=')
+  assert.ok(calls[0].url.includes(`search_query=${encodeURIComponent(POPULAR_AI_QUERY)}`))
+  assert.ok(calls[0].url.includes(`sp=${POPULAR_TODAY_SP}`))
+  assert.equal(calls[1].method, 'POST')
+  assert.equal(JSON.parse(calls[1].body).continuation, 'TOK1')
+})
+
+test('continuation 요청이 실패해도 첫 페이지 인기 영상은 그대로 돌려준다', async () => {
+  const page1 = {
+    contents: [
+      { videoRenderer: { videoId: 'vid_0000001', title: { simpleText: 'AI 1' } } },
+      { continuationItemRenderer: { continuationEndpoint: { continuationCommand: { token: 'TOK_FAIL' } } } }
+    ]
+  }
+  const fakeFetch = async (url) => {
+    if (url.startsWith('https://www.youtube.com/results?')) {
+      return { ok: true, text: async () => `<script>"INNERTUBE_API_KEY":"K"</script><script>var ytInitialData = ${JSON.stringify(page1)};</script>` }
+    }
+    if (url.includes('/youtubei/v1/search')) throw new Error('network error')
+    return { ok: false }
+  }
+  const list = await popularYoutube({ fetchImpl: fakeFetch })
+  assert.equal(list.length, 1)
+  assert.equal(list[0].id, 'vid_0000001')
 })

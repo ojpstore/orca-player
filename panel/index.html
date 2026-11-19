@@ -225,7 +225,7 @@
       <div class="grip" data-target="yt-player" data-min="90" title="끌어서 플레이어 높이 조절"></div>
       <div class="list-head">
         <h2 id="yt-count">검색 결과</h2>
-        <button class="icon" id="yt-reset" title="초기화 (재생 중지, 받는 중인 영상 취소, 검색 결과 지우기)"><svg><use href="#i-reset" /></svg></button>
+        <button class="icon" id="yt-reset" title="초기화 (재생 중지, 받는 중인 영상 취소, 오늘의 AI 기술 트렌드로 되돌리기)"><svg><use href="#i-reset" /></svg></button>
       </div>
       <ul class="videos" id="yt-results"></ul>
     </div>
@@ -712,17 +712,18 @@
         for (const tab of document.querySelectorAll('[role=tab]')) tab.setAttribute('aria-selected', tab.dataset.tab === name)
         $('tab-music').hidden = name !== 'music'
         $('tab-youtube').hidden = name !== 'youtube'
+        if (name === 'youtube' && !ytLoaded) loadPopular()
         try {
           localStorage.setItem('tab', name)
         } catch {}
       }
       document.querySelector('.tabs').onclick = (e) => e.target.dataset.tab && showTab(e.target.dataset.tab)
-      try {
-        if (localStorage.getItem('tab') === 'youtube') showTab('youtube')
-      } catch {}
 
       // 유튜브: 패널은 iframe·외부 미디어가 막혀 있어서(CSP) worker가 yt-dlp로 받은 파일을 조각으로 넘겨 blob으로 재생한다.
       let videos = []
+      let listTitle = '검색 결과'
+      let ytLoaded = false
+      let searchSeq = 0
       let playing = null // 지금 재생(준비) 중인 영상
       let videoUrl = null
       const video = $('yt-video')
@@ -774,7 +775,7 @@
         }
       })
       function renderVideos() {
-        $('yt-count').textContent = videos.length ? `검색 결과 (${videos.length})` : '검색 결과'
+        $('yt-count').textContent = videos.length ? `${listTitle} (${videos.length})` : listTitle
         $('yt-results').replaceChildren(
           ...videos.map((v, i) => {
             const li = document.createElement('li')
@@ -788,7 +789,8 @@
             li.querySelector('.vtitle').textContent = v.title
             const [channel, stats] = li.querySelectorAll('.vmeta')
             channel.textContent = v.channel
-            stats.textContent = [v.views && `조회수 ${v.views}`, v.published].filter(Boolean).join(' · ')
+            const views = v.views ? (/조회수|시청/.test(v.views) ? v.views : `조회수 ${v.views}`) : ''
+            stats.textContent = [views, v.published].filter(Boolean).join(' · ')
             return li
           })
         )
@@ -855,28 +857,51 @@
       video.addEventListener('play', () => audio.pause())
       audio.addEventListener('play', () => video.pause())
 
+      async function loadPopular() {
+        ytLoaded = true
+        const seq = ++searchSeq
+        setStatus('오늘의 AI 기술 트렌드를 불러오는 중…')
+        try {
+          const output = await request('youtube.popular', {})
+          if (seq !== searchSeq) return
+          listTitle = '오늘의 AI 기술 트렌드'
+          videos = output.videos ?? []
+          renderVideos()
+          $('yt-results').scrollTop = 0
+          setStatus(videos.length ? '오늘의 AI 기술 트렌드입니다. 영상을 누르면 위에서 재생됩니다.' : '인기 영상을 찾지 못했습니다.')
+        } catch (error) {
+          if (seq !== searchSeq) return
+          ytLoaded = false
+          setStatus(`인기 영상을 불러오지 못했습니다: ${error.message}`, true)
+        }
+      }
       async function searchYoutube(query) {
-        if (!query) return
+        if (!query) return loadPopular()
+        ytLoaded = true
+        const seq = ++searchSeq
         $('yt-go').disabled = true
         setStatus('검색 중…')
         try {
           const output = await request('youtube.search', { query })
+          if (seq !== searchSeq) return
           if (output.opened) return setStatus('Orca 브라우저 탭에서 열었습니다.')
           if (output.videoId) {
             setStatus('주소의 영상을 재생합니다.')
             return playVideo({ id: output.videoId, title: query, thumb: '' })
           }
+          listTitle = '검색 결과'
           videos = output.videos ?? []
           renderVideos()
           $('yt-results').scrollTop = 0
           setStatus(videos.length ? '영상을 누르면 위에서 재생됩니다.' : '검색 결과가 없습니다.')
         } catch (error) {
+          if (seq !== searchSeq) return
           setStatus(`검색하지 못했습니다: ${error.message}`, true)
         } finally {
-          $('yt-go').disabled = false
+          if (seq === searchSeq) $('yt-go').disabled = false
         }
       }
-      // 재생과 받는 중인 영상을 멈추고, 메모리와 검색 화면을 처음 상태로 돌린다.
+      // 재생과 받는 중인 영상을 멈추고, 메모리와 검색 화면을 처음 상태(오늘의 AI 기술 트렌드)로 돌린다.
       $('yt-reset').onclick = () => {
         playing = null
         video.pause()
@@ -885,12 +910,13 @@
         if (videoUrl) URL.revokeObjectURL(videoUrl)
         videoUrl = null
         videos = []
+        listTitle = '오늘의 AI 기술 트렌드'
         renderVideos()
         $('yt-query').value = ''
         $('yt-go').disabled = false
-        setStatus('검색어나 유튜브 주소를 입력하세요.')
         screen('검색 결과에서 영상을 누르면 여기에서 재생됩니다.', [], null)
         request('youtube.reset', {}).catch(() => {}) // worker가 받던 다운로드를 멈추고 임시 파일을 지운다.
+        loadPopular()
       }
       $('yt-form').onsubmit = (e) => {
         e.preventDefault()
@@ -900,6 +926,9 @@
         const li = e.target.closest('li')
         if (li) playVideo(videos[li.dataset.i])
       }
+      try {
+        if (localStorage.getItem('tab') === 'youtube') showTab('youtube')
+      } catch {}
 
       if ('mediaSession' in navigator) {
         // 토글이 아니라 명령대로: 재생 중 play, 정지 중 pause가 와도 상태를 뒤집지 않는다.

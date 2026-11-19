@@ -33,12 +33,7 @@ export function videoId(input) {
 
 const text = (node) => node?.simpleText ?? node?.runs?.map((run) => run.text).join('') ?? ''
 
-// 공식 API 키 없이 검색 페이지에 박힌 ytInitialData에서 영상만 뽑는다.
-// ponytail: 유튜브가 페이지 구조를 바꾸면 깨진다. 그때는 videoRenderer 위치만 다시 찾으면 된다.
-export function parseSearch(html) {
-  const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/s)
-  // 회사 보안망 등은 유튜브 대신 짧은 차단 페이지를 돌려준다.
-  if (!match) throw new Error('유튜브 검색 결과를 읽지 못했습니다. 네트워크(회사 보안 등)에서 차단되었을 수 있습니다.')
+function extractVideos(root) {
   const videos = []
   const walk = (value) => {
     if (!value || typeof value !== 'object') return
@@ -49,26 +44,63 @@ export function parseSearch(html) {
         title: text(v.title),
         channel: text(v.ownerText),
         length: text(v.lengthText) || (v.badges?.some((b) => b.metadataBadgeRenderer?.style?.includes('LIVE')) ? 'LIVE' : ''),
-        views: text(v.shortViewCountText),
+        views: text(v.shortViewCountText).replace(/^조회수\s+(.+?)회$/, '$1'),
         published: text(v.publishedTimeText)
       })
       return
     }
     for (const child of Object.values(value)) walk(child)
   }
-  walk(JSON.parse(match[1]))
+  walk(root)
   return videos
 }
+
+function continuationToken(root) {
+  let token = null
+  const walk = (value) => {
+    if (token || !value || typeof value !== 'object') return
+    const found = value.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token
+    if (found) {
+      token = found
+      return
+    }
+    for (const child of Object.values(value)) walk(child)
+  }
+  walk(root)
+  return token
+}
+
+function parseSearchPage(html) {
+  const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/s)
+  // 회사 보안망 등은 유튜브 대신 짧은 차단 페이지를 돌려준다.
+  if (!match) throw new Error('유튜브 검색 결과를 읽지 못했습니다. 네트워크(회사 보안 등)에서 차단되었을 수 있습니다.')
+  const data = JSON.parse(match[1])
+  return {
+    videos: extractVideos(data),
+    continuation: continuationToken(data),
+    apiKey: html.match(/"INNERTUBE_API_KEY":"([^"]+)"/)?.[1] ?? '',
+    clientVersion: html.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/)?.[1] ?? '2.20260101.00.00'
+  }
+}
+
+// 공식 API 키 없이 검색 페이지에 박힌 ytInitialData에서 영상만 뽑는다.
+// ponytail: 유튜브가 페이지 구조를 바꾸면 깨진다. 그때는 videoRenderer 위치만 다시 찾으면 된다.
+export const parseSearch = (html) => parseSearchPage(html).videos
 
 const BROWSER_HEADERS = {
   'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36',
   'accept-language': 'ko-KR,ko;q=0.9'
 }
 
+// 기본 검색 결과: 오늘 업로드된 AI 기술 트렌드 인기 영상(조회수순) 30개.
+export const POPULAR_AI_QUERY = 'AI 에이전트 OR 클로드 OR 제미나이 OR GPT OR LLM'
+export const POPULAR_TODAY_SP = 'CAMSBAgCEAE%3D'
+export const POPULAR_LIMIT = 30
+
 // 패널은 외부 이미지를 못 불러서 썸네일을 data URL로 넘긴다. 실패한 썸네일은 비워 둔다.
-async function thumbnail(id) {
+async function thumbnail(id, fetchImpl = fetch) {
   try {
-    const res = await fetch(`https://i.ytimg.com/vi/${id}/mqdefault.jpg`, { signal: AbortSignal.timeout(8000) })
+    const res = await fetchImpl(`https://i.ytimg.com/vi/${id}/mqdefault.jpg`, { signal: AbortSignal.timeout(8000) })
     if (!res.ok) return ''
     return `data:image/jpeg;base64,${Buffer.from(await res.arrayBuffer()).toString('base64')}`
   } catch {
@@ -76,16 +108,51 @@ async function thumbnail(id) {
   }
 }
 
-export async function searchYoutube(query) {
-  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=ko&gl=KR`
-  const res = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15000) }).catch((error) => {
+export async function searchYoutube(query, { sp = '', limit = 0, fetchImpl = fetch } = {}) {
+  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}${sp ? `&sp=${sp}` : ''}&hl=ko&gl=KR`
+  const res = await fetchImpl(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15000) }).catch((error) => {
     throw new Error(`유튜브에 연결하지 못했습니다 (${error.cause?.code ?? error.cause?.message ?? error.message})`)
   })
   if (!res.ok) throw new Error(`유튜브 응답 ${res.status}`)
-  const videos = parseSearch(await res.text())
-  await Promise.all(videos.map(async (video) => (video.thumb = await thumbnail(video.id))))
-  return videos
+  const page = parseSearchPage(await res.text())
+  const seen = new Set()
+  const videos = []
+  const append = (items) => {
+    for (const item of items) {
+      if (seen.has(item.id)) continue
+      seen.add(item.id)
+      videos.push(item)
+    }
+  }
+  append(page.videos)
+  // 첫 검색 페이지는 보통 20개만 오므로, limit(예: 30개)을 채우기 위해 다음 페이지를 이어서 받는다.
+  let token = page.continuation
+  for (let i = 0; limit > 0 && videos.length < limit && token && page.apiKey && i < 3; i++) {
+    try {
+      const more = await fetchImpl(`https://www.youtube.com/youtubei/v1/search?key=${page.apiKey}`, {
+        method: 'POST',
+        headers: { ...BROWSER_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          context: { client: { hl: 'ko', gl: 'KR', clientName: 'WEB', clientVersion: page.clientVersion } },
+          continuation: token
+        }),
+        signal: AbortSignal.timeout(15000)
+      })
+      if (!more.ok) break
+      const data = await more.json()
+      append(extractVideos(data))
+      token = continuationToken(data)
+    } catch {
+      break
+    }
+  }
+  const result = limit > 0 ? videos.slice(0, limit) : videos
+  await Promise.all(result.map(async (video) => (video.thumb = await thumbnail(video.id, fetchImpl))))
+  return result
 }
+
+export const popularYoutube = (options = {}) =>
+  searchYoutube(POPULAR_AI_QUERY, { sp: POPULAR_TODAY_SP, limit: POPULAR_LIMIT, ...options })
 
 // --- 패널 안 재생: 패널은 외부 미디어를 못 틀어서(CSP media-src 'self' blob:) yt-dlp로 받은 파일을 조각내 넘긴다.
 // ponytail: Windows 전용(yt-dlp.exe). 다른 OS가 필요하면 바이너리 이름과 설치 URL만 나누면 된다.
@@ -456,6 +523,13 @@ export default function activate(plugin) {
     }
   }
   plugin.panels.handle('youtube.open', ({ query } = {}) => open(query))
+  plugin.panels.handle('youtube.popular', async () => {
+    try {
+      return { videos: await popularYoutube() }
+    } catch (error) {
+      return { error: error.message }
+    }
+  })
   // 유튜브 주소를 넣으면 검색하지 않고 바로 연다.
   plugin.panels.handle('youtube.search', async ({ query } = {}) => {
     const q = String(query ?? '').trim()
